@@ -30,6 +30,7 @@ class StagedFilter:
     global_ids:        Set[str] = field(default_factory=set)
     active_quest_ids:  Set[str] = field(default_factory=set)
     plugin_indices:    Set[int] = field(default_factory=set)
+    appearance_fields: Set[str] = field(default_factory=set)
 
     include_char_info:        bool = False
     include_details:          bool = False
@@ -109,6 +110,7 @@ class SaveDumpWriter:
 
         # Patch editable sections in-place
         lines = self._patch_player_character(lines, sections)
+        lines = self._patch_appearance(lines, sections)
         lines = self._patch_character_info(lines, sections)
         lines = self._patch_vitals(lines, sections)
         lines = self._patch_inventory(lines, sections)
@@ -132,10 +134,12 @@ class SaveDumpWriter:
 
     def _index_sections(self, lines: List[str]) -> Dict[str, tuple]:
         """Build section name -> (start_line, end_line) index."""
-        if self.format == "classic":
-            pattern = re.compile(r'^--- (.+?) ---$')
-        else:
+        # Detect delimiter from actual raw text (modern xOBSE uses === ===)
+        has_triple_equals = any(re.match(r'^=== [A-Z].+ ===$', ln.strip()) for ln in lines[:100])
+        if has_triple_equals:
             pattern = re.compile(r'^=== (.+?) ===$')
+        else:
+            pattern = re.compile(r'^--- (.+?) ---$')
 
         section_starts = []
         for i, line in enumerate(lines):
@@ -157,16 +161,22 @@ class SaveDumpWriter:
         """Mark entire sections for deletion based on StagedFilter flags/sets."""
 
         def rm(name_rem, name_classic=None):
-            key = name_rem if self.format == "remastered" else (name_classic or name_rem)
-            rng = sections.get(key)
-            if rng:
-                start, end = rng
-                for j in range(start, end):
-                    lines[j] = _DELETED_LINE
+            # Try both name variants — modern xOBSE uses uppercase like remastered
+            for key in (name_rem, name_classic):
+                if key is None:
+                    continue
+                rng = sections.get(key)
+                if rng:
+                    start, end = rng
+                    for j in range(start, end):
+                        lines[j] = _DELETED_LINE
+                    return
 
         if not sf.include_char_info:
             rm("PLAYER CHARACTER", "Player Character")
             rm("CHARACTER INFO", "Character Info")
+        if not sf.include_char_info and not sf.appearance_fields:
+            rm("APPEARANCE")
 
         if not sf.include_details:
             rm("DERIVED STATS", "Derived Stats")
@@ -218,6 +228,8 @@ class SaveDumpWriter:
         if sf.include_char_info:
             kept.update(["PLAYER CHARACTER", "CHARACTER INFO",
                          "Player Character", "Character Info"])
+        if sf.include_char_info or sf.appearance_fields:
+            kept.add("APPEARANCE")
         if sf.include_details:
             kept.update(["DERIVED STATS", "MISC STATISTICS", "FAME / INFAMY / BOUNTY",
                          "Derived Stats", "Misc Statistics", "Fame / Infamy / Bounty"])
@@ -254,8 +266,12 @@ class SaveDumpWriter:
         return lines
 
     def _get_section_range(self, sections: Dict, name: str):
-        """Get (start, end) for a section, or None if not found."""
-        return sections.get(name)
+        """Get (start, end) for a section, or None if not found.
+        Tries the exact name first, then uppercase (for modern xOBSE dumps)."""
+        rng = sections.get(name)
+        if rng:
+            return rng
+        return sections.get(name.upper())
 
     # ── Inventory patching ───────────────────────────────────────────────
 
@@ -668,6 +684,65 @@ class SaveDumpWriter:
             if stripped.startswith("Player Name:"):
                 colon_pos = lines[i].find(":")
                 lines[i] = lines[i][:colon_pos + 1] + f" {self.data.character.name}"
+
+        return lines
+
+    # ── Appearance patching ──────────────────────────────────────────────
+
+    # Mapping from appearance field storage key to dump line prefix
+    _APPEARANCE_PREFIX_MAP = {
+        "hair":               "Hair:",
+        "eyes":               "Eyes:",
+        "hair_color":         "HairColor:",
+        "hair_length":        "HairLength:",
+        "facegen_geometry":   "FaceGenGeometry:",
+        "facegen_asymmetry":  "FaceGenAsymmetry:",
+        "facegen_texture":    "FaceGenTexture:",
+        "facegen_geometry2":  "FaceGenGeometry2:",
+        "facegen_asymmetry2": "FaceGenAsymmetry2:",
+        "facegen_texture2":   "FaceGenTexture2:",
+    }
+
+    def _patch_appearance(self, lines: List[str], sections: Dict) -> List[str]:
+        """Patch appearance data (hair, eyes, FaceGen) in APPEARANCE section.
+        If a staged filter is active, only keep lines for staged fields."""
+        rng = self._get_section_range(sections, "APPEARANCE")
+        if not rng:
+            return lines
+
+        a = self.data.appearance
+        sf = self._sf
+
+        # Build set of prefixes to keep (if filtering) and values to patch
+        if sf and sf.appearance_fields:
+            kept_prefixes = set()
+            for field_key in sf.appearance_fields:
+                prefix = self._APPEARANCE_PREFIX_MAP.get(field_key)
+                if prefix:
+                    kept_prefixes.add(prefix)
+        else:
+            kept_prefixes = None  # keep all
+
+        start, end = rng
+        for i in range(start + 1, end):
+            stripped = lines[i].strip()
+            if not stripped:
+                continue
+            matched = False
+            for field_key, prefix in self._APPEARANCE_PREFIX_MAP.items():
+                if stripped.startswith(prefix):
+                    matched = True
+                    if kept_prefixes is not None and prefix not in kept_prefixes:
+                        lines[i] = _DELETED_LINE
+                    else:
+                        value = getattr(a, field_key, "")
+                        if value:
+                            colon_pos = lines[i].find(":")
+                            lines[i] = lines[i][:colon_pos + 1] + f" {value}"
+                    break
+            # Delete unrecognised appearance lines when filtering
+            if not matched and kept_prefixes is not None:
+                lines[i] = _DELETED_LINE
 
         return lines
 

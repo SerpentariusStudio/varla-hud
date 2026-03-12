@@ -6,8 +6,12 @@ from pathlib import Path
 _SETTINGS_PATH = Path.home() / ".varla_hud_settings.json"
 
 _defaults = {
-    "default_dump_path": "",
+    "default_dump_path": "",            # legacy / auto
+    "default_dump_path_classic": "",    # xOBSE
+    "default_dump_path_remastered": "", # obse64
     "game_format": "auto",   # "auto" | "remastered" | "classic"
+    "skip_import_filter": False,
+    "language": "en",
 }
 
 _data: dict = {}

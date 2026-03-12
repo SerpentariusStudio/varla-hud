@@ -32,6 +32,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QDrag, QPixmap, QIcon, QColor
 
 from theme import COLORS
+from translations import tr
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -454,6 +455,7 @@ class DualPanelWidget(QWidget):
     The right panel allows inline editing of editable columns.
     """
     staged_changed = Signal()
+    clear_target_requested = Signal()
 
     def __init__(self, columns: list[ColumnDef], parent=None):
         super().__init__(parent)
@@ -476,11 +478,11 @@ class DualPanelWidget(QWidget):
         splitter = QSplitter(Qt.Horizontal)
 
         left_frame, self._left_list, self._left_grid, self._left_stack = \
-            self._build_panel("left", "Available",
+            self._build_panel("left", tr("Available"),
                               self._left_model, self._left_proxy)
         center_frame = self._build_center_buttons()
         right_frame, self._right_list, self._right_grid, self._right_stack = \
-            self._build_panel("right", "Staged for Import",
+            self._build_panel("right", tr("Staged for target.txt"),
                               self._right_model, self._right_proxy)
 
         splitter.addWidget(left_frame)
@@ -522,7 +524,7 @@ class DualPanelWidget(QWidget):
 
         # Search bar
         search = QLineEdit()
-        search.setPlaceholderText("Filter…")
+        search.setPlaceholderText(tr("Search..."))
         search.setObjectName("searchBar")
         search.setClearButtonEnabled(True)
         search.textChanged.connect(proxy.setFilterFixedString)
@@ -590,16 +592,23 @@ class DualPanelWidget(QWidget):
         layout.setAlignment(Qt.AlignCenter)
         frame.setFixedWidth(90)
         for label, slot in [
-            ("All →",  self._move_all_to_right),
-            ("Sel →",  self._move_selected_to_right),
-            ("← Sel",  self._move_selected_to_left),
-            ("← All",  self._move_all_to_left),
+            (tr("All →"),  self._move_all_to_right),
+            (tr("Sel →"),  self._move_selected_to_right),
+            (tr("← Sel"),  self._move_selected_to_left),
+            (tr("← All"),  self._move_all_to_left),
         ]:
             btn = QPushButton(label)
             btn.setObjectName("transferBtn")
             btn.setFixedWidth(80)
             btn.clicked.connect(slot)
             layout.addWidget(btn)
+
+        layout.addSpacing(8)
+        clear_btn = QPushButton(tr("Clear Target"))
+        clear_btn.setObjectName("transferBtn")
+        clear_btn.setFixedWidth(80)
+        clear_btn.clicked.connect(self.clear_target_requested.emit)
+        layout.addWidget(clear_btn)
         return frame
 
     # ── Transfer operations ───────────────────────────────────────────────

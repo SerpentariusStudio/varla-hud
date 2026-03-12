@@ -21,6 +21,7 @@ from dual_panel import PanelItem
 from save_dump_writer import SaveDumpWriter, StagedFilter as WriterSF
 from import_generator import ImportLogGenerator
 from theme import COLORS
+from translations import tr
 
 # ── Categories shown in order ─────────────────────────────────────────────────
 
@@ -138,7 +139,7 @@ class ImportWindow(QDialog):
 
     def __init__(self, staged_items: list, char_data: CharacterData, dump_path: Path, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Import — Select items to export to target.txt")
+        self.setWindowTitle(tr("Import — Select items to export to target.txt"))
         self.resize(1200, 720)
         self._char_data = char_data
         self._dump_path = dump_path
@@ -169,9 +170,9 @@ class ImportWindow(QDialog):
         left_lay.setSpacing(4)
 
         left_top = QHBoxLayout()
-        left_top.addWidget(QLabel("Available"))
+        left_top.addWidget(QLabel(tr("Available")))
         self._left_search = QLineEdit()
-        self._left_search.setPlaceholderText("Search…")
+        self._left_search.setPlaceholderText(tr("Search..."))
         self._left_search.textChanged.connect(lambda t: self._filter_tree(self._left_tree, t))
         left_top.addWidget(self._left_search)
         left_lay.addLayout(left_top)
@@ -188,10 +189,10 @@ class ImportWindow(QDialog):
         btn_lay.setAlignment(Qt.AlignVCenter)
         btn_lay.setSpacing(8)
         for label, slot in [
-            ("All →",  self._move_all_right),
-            ("Sel →",  self._move_selected_right),
-            ("← Sel",  self._move_selected_left),
-            ("← All",  self._move_all_left),
+            (tr("All →"),  self._move_all_right),
+            (tr("Sel →"),  self._move_selected_right),
+            (tr("← Sel"),  self._move_selected_left),
+            (tr("← All"),  self._move_all_left),
         ]:
             b = QPushButton(label)
             b.setFixedWidth(70)
@@ -206,9 +207,9 @@ class ImportWindow(QDialog):
         right_lay.setSpacing(4)
 
         right_top = QHBoxLayout()
-        right_top.addWidget(QLabel("Staged for target.txt"))
+        right_top.addWidget(QLabel(tr("Staged for target.txt")))
         self._right_search = QLineEdit()
-        self._right_search.setPlaceholderText("Search…")
+        self._right_search.setPlaceholderText(tr("Search..."))
         self._right_search.textChanged.connect(lambda t: self._filter_tree(self._right_tree, t))
         right_top.addWidget(self._right_search)
         right_lay.addLayout(right_top)
@@ -223,11 +224,11 @@ class ImportWindow(QDialog):
         # ── Bottom bar ────────────────────────────────────────────────────
         bot = QHBoxLayout()
         bot.addStretch()
-        write_btn = QPushButton("Write target.txt")
+        write_btn = QPushButton(tr("Write target.txt"))
         write_btn.setFixedHeight(32)
         write_btn.clicked.connect(self._write_target)
         bot.addWidget(write_btn)
-        close_btn = QPushButton("Close")
+        close_btn = QPushButton(tr("Close"))
         close_btn.setFixedHeight(32)
         close_btn.clicked.connect(self.accept)
         bot.addWidget(close_btn)
@@ -437,13 +438,18 @@ class ImportWindow(QDialog):
         attr_items:  dict = {}   # attr_name     -> PanelItem
         ci_items:    dict = {}   # field key     -> PanelItem
 
+        _BASIC_CHAR_KEYS = {"name", "race", "class_name", "birthsign", "level", "sex"}
         for uid in staged:
             pi = self._all_items.get(uid)
             fid = pi.values.get("form_id", "") if pi else ""
             if uid.startswith("ci."):
-                sf.include_char_info = True
+                key = uid[3:]
+                if key in _BASIC_CHAR_KEYS:
+                    sf.include_char_info = True
+                else:
+                    sf.appearance_fields.add(key)
                 if pi:
-                    ci_items[uid[3:]] = pi
+                    ci_items[key] = pi
             elif uid.startswith("inv."):
                 if fid: sf.inventory_ids.add(fid)
             elif uid.startswith("spell."):
@@ -492,6 +498,7 @@ class ImportWindow(QDialog):
 
         if ci_items:
             c = self._char_data.character
+            a = self._char_data.appearance
             for key, pi in ci_items.items():
                 val = pi.values.get("value", "")
                 if key == "level":
@@ -507,6 +514,8 @@ class ImportWindow(QDialog):
                     c.birthsign = val
                 elif key == "sex":
                     c.sex = val
+                elif hasattr(a, key):
+                    setattr(a, key, val)
 
         if cq_sources:
             sf.include_completed_quests = True
@@ -514,7 +523,9 @@ class ImportWindow(QDialog):
 
         target_path = self._dump_path.parent / "target.txt"
         try:
-            if self._char_data.dump_format == "classic":
+            raw = self._char_data.raw_dump_text or ""
+            is_legacy = self._char_data.dump_format == "classic" and "=== " not in raw[:500]
+            if is_legacy:
                 self._write_target_classic(sf, target_path)
             else:
                 writer = SaveDumpWriter(self._char_data)

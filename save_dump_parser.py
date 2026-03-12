@@ -14,7 +14,7 @@ from models import (
     GameTime, ActiveMagicEffect, PlayerPosition, WeatherInfo,
     SkillXPProgress, TrainingProgress, QuickKeySlot, StatusEffects,
     ActorValueModifier, ItemCondition, EnchantmentCharge, StolenItem,
-    GoldEconomy
+    GoldEconomy, Appearance
 )
 
 # Mapping from save dump misc stat names (lowercased) to PCMISCSTAT index
@@ -150,10 +150,15 @@ class SaveDumpParser:
         data = CharacterData()
 
         # Store dump metadata for round-trip writing
-        data.dump_format = "remastered"
+        # Auto-detect: xOBSE header → classic, otherwise remastered
+        if any("xOBSE" in line for line in self.lines[:10]):
+            data.dump_format = "classic"
+        else:
+            data.dump_format = "remastered"
         data.raw_dump_text = raw_text
 
         data.character = self._parse_character_info()
+        data.appearance = self._parse_appearance()
         data.player_position = self._parse_position()
         data.fame, data.infamy, data.bounty = self._parse_fame_infamy_bounty()
         data.game_time = self._parse_game_time()
@@ -261,6 +266,31 @@ class SaveDumpParser:
                 info.birthsign = raw.split("(")[0].strip()
 
         return info
+
+    def _parse_appearance(self) -> Appearance:
+        """Parse APPEARANCE section (hair, eyes, FaceGen data)."""
+        app = Appearance()
+        _map = {
+            "Hair:":               "hair",
+            "Eyes:":               "eyes",
+            "HairColor:":          "hair_color",
+            "HairLength:":         "hair_length",
+            "FaceGenGeometry:":    "facegen_geometry",
+            "FaceGenAsymmetry:":   "facegen_asymmetry",
+            "FaceGenTexture:":     "facegen_texture",
+            "FaceGenGeometry2:":   "facegen_geometry2",
+            "FaceGenAsymmetry2:":  "facegen_asymmetry2",
+            "FaceGenTexture2:":    "facegen_texture2",
+        }
+        for line in self._get_section_lines("APPEARANCE"):
+            line = line.strip()
+            if not line:
+                continue
+            for prefix, attr in _map.items():
+                if line.startswith(prefix):
+                    setattr(app, attr, line[len(prefix):].strip())
+                    break
+        return app
 
     def _parse_position(self) -> PlayerPosition:
         """Parse POSITION & ROTATION section."""
@@ -659,12 +689,14 @@ class SaveDumpParser:
             if not line or line.startswith("Format:") or line.endswith("Skills:") or line.startswith("Skill Highlights:"):
                 continue
 
-            # Format: "  Armorer: 34 (Base: 34)"
-            m = re.match(r'(\w+):\s*(\d+)\s*\(Base:\s*(\d+)\)', line)
+            # Format: "  Armorer: 34 (Base: 34)" or "  Hand To Hand: 13 (Base: 13)"
+            m = re.match(r'([\w\s]+?):\s*(\d+)\s*\(Base:\s*(\d+)\)', line)
             if m:
-                skill_name = m.group(1)
+                raw_name = m.group(1).strip()
                 current_value = int(m.group(2))
                 base_value = int(m.group(3))
+                # Convert multi-word names to storage form (e.g. "Hand To Hand" → "HandToHand")
+                skill_name = raw_name.replace(" ", "")
                 if skill_name in SKILL_NAMES:
                     skills[skill_name] = base_value
                     skills_current[skill_name] = current_value
@@ -1801,7 +1833,7 @@ def is_classic_save_dump_format(file_path: Path) -> bool:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             for _ in range(5):
                 line = f.readline()
-                if "xOBSE Save Dump" in line:
+                if "xOBSE" in line:
                     return True
     except (IOError, OSError):
         pass
@@ -1823,10 +1855,25 @@ def is_save_dump_format(file_path: Path) -> bool:
     return False
 
 
+def _uses_triple_equals_format(file_path: Path) -> bool:
+    """Check if a file uses the modern === SECTION === format (xOBSE or obse64)."""
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read(4096)
+            return bool(re.search(r'^=== [A-Z].+ ===$', text, re.MULTILINE))
+    except (IOError, OSError):
+        return False
+
+
 def parse_save_dump(dump_path: Path) -> CharacterData:
-    """Parse a save dump file (auto-detects classic vs remastered) and return CharacterData."""
-    if is_classic_save_dump_format(dump_path):
-        parser = ClassicSaveDumpParser(dump_path)
-    else:
+    """Parse a save dump file (auto-detects format) and return CharacterData.
+
+    Both modern xOBSE and obse64 use === SECTION === format and are handled
+    by SaveDumpParser (which auto-detects dump_format from the file header).
+    The legacy ClassicSaveDumpParser is only used for old --- Section --- files.
+    """
+    if _uses_triple_equals_format(dump_path):
         parser = SaveDumpParser(dump_path)
+    else:
+        parser = ClassicSaveDumpParser(dump_path)
     return parser.parse()

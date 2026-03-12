@@ -362,6 +362,21 @@ class GoldEconomy:
 
 
 @dataclass
+class Appearance:
+    """Character appearance / FaceGen data."""
+    hair: str = ""
+    eyes: str = ""
+    hair_color: str = ""
+    hair_length: str = ""
+    facegen_geometry: str = ""
+    facegen_asymmetry: str = ""
+    facegen_texture: str = ""
+    facegen_geometry2: str = ""
+    facegen_asymmetry2: str = ""
+    facegen_texture2: str = ""
+
+
+@dataclass
 class CharacterData:
     """Complete character data."""
     character: CharacterInfo = field(default_factory=CharacterInfo)
@@ -401,6 +416,7 @@ class CharacterData:
     enchantment_charges: List['EnchantmentCharge'] = field(default_factory=list)
     stolen_items: List['StolenItem'] = field(default_factory=list)
     gold_economy: 'GoldEconomy' = field(default_factory=GoldEconomy)
+    appearance: 'Appearance' = field(default_factory=Appearance)
     racial_abilities: List[str] = field(default_factory=list)
     class_details: str = ""
     equipped_items_detail: str = ""

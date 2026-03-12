@@ -11,6 +11,7 @@ from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QIcon, QPixmap
 
 from theme import COLORS
+from translations import tr
 
 
 # ── Navigation Structure ─────────────────────────────────────────────────────
@@ -90,7 +91,7 @@ class TopTabBar(QWidget):
 
         for tab_key in TAB_ORDER:
             tab_info = NAVIGATION_STRUCTURE[tab_key]
-            btn = QPushButton(tab_info["label"])
+            btn = QPushButton(tr(tab_info["label"]))
             btn.setObjectName("topTabBtn")
             btn.setCursor(Qt.PointingHandCursor)
             btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -173,7 +174,7 @@ class SubNavBar(QWidget):
                 icon_label.setText("\u25C6")  # diamond fallback
             btn_layout.addWidget(icon_label)
 
-            text_label = QLabel(page["label"])
+            text_label = QLabel(tr(page["label"]))
             text_label.setAlignment(Qt.AlignCenter)
             text_label.setAttribute(Qt.WA_TransparentForMouseEvents)
             text_label.setStyleSheet(f"font-size: 8pt; background: transparent;")

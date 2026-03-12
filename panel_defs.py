@@ -186,6 +186,7 @@ def extract_items(page_key: str, data: CharacterData) -> list[PanelItem]:
 
 def _extract_char_info(d: CharacterData) -> list[PanelItem]:
     c = d.character
+    a = d.appearance
     fields = [
         ("name",      "Name",      c.name),
         ("race",      "Race",      c.race),
@@ -194,6 +195,20 @@ def _extract_char_info(d: CharacterData) -> list[PanelItem]:
         ("level",     "Level",     c.level),
         ("sex",       "Sex",       c.sex),
     ]
+    # Appearance fields (only if data present)
+    if a.hair or a.eyes:
+        fields += [
+            ("hair",               "Hair",               a.hair),
+            ("eyes",               "Eyes",               a.eyes),
+            ("hair_color",         "Hair Color",         a.hair_color),
+            ("hair_length",        "Hair Length",        a.hair_length),
+            ("facegen_geometry",   "FaceGen Geometry",   a.facegen_geometry),
+            ("facegen_asymmetry",  "FaceGen Asymmetry",  a.facegen_asymmetry),
+            ("facegen_texture",    "FaceGen Texture",    a.facegen_texture),
+            ("facegen_geometry2",  "FaceGen Geometry 2", a.facegen_geometry2),
+            ("facegen_asymmetry2", "FaceGen Asymmetry 2",a.facegen_asymmetry2),
+            ("facegen_texture2",   "FaceGen Texture 2",  a.facegen_texture2),
+        ]
     return [
         PanelItem(uid=f"ci.{k}", values={"field": label, "value": str(v)})
         for k, label, v in fields
@@ -466,6 +481,7 @@ class StagedFilter:
     global_ids:        set = field(default_factory=set)
     active_quest_ids:  set = field(default_factory=set)   # form_ids
     plugin_indices:    set = field(default_factory=set)
+    appearance_fields: set = field(default_factory=set)   # e.g. {"eyes", "hair"}
 
     include_char_info:        bool = False
     include_details:          bool = False
@@ -483,22 +499,27 @@ def build_staged_filter(panels: dict, char_data: CharacterData) -> StagedFilter:
     sf = StagedFilter()
 
     # ── char_info ─────────────────────────────────────────────────────────
+    _BASIC_CHAR_KEYS = {"name", "race", "class_name", "birthsign", "level", "sex"}
     staged_ci = panels.get("char_info", None)
     if staged_ci:
         items = staged_ci.get_staged_items()
         if items:
-            sf.include_char_info = True
             for pi in items:
                 key = pi.uid[3:]   # strip "ci."
                 val = pi.values.get("value", "")
-                if key == "name":          char_data.character.name       = val
-                elif key == "race":        char_data.character.race       = val
-                elif key == "class_name":  char_data.character.class_name = val
-                elif key == "birthsign":   char_data.character.birthsign  = val
-                elif key == "level":
-                    try: char_data.character.level = int(val)
-                    except ValueError: pass
-                elif key == "sex":         char_data.character.sex = val
+                if key in _BASIC_CHAR_KEYS:
+                    sf.include_char_info = True
+                    if key == "name":          char_data.character.name       = val
+                    elif key == "race":        char_data.character.race       = val
+                    elif key == "class_name":  char_data.character.class_name = val
+                    elif key == "birthsign":   char_data.character.birthsign  = val
+                    elif key == "level":
+                        try: char_data.character.level = int(val)
+                        except ValueError: pass
+                    elif key == "sex":         char_data.character.sex = val
+                elif hasattr(char_data.appearance, key):
+                    sf.appearance_fields.add(key)
+                    setattr(char_data.appearance, key, val)
 
     # ── attributes ────────────────────────────────────────────────────────
     if "attributes" in panels:

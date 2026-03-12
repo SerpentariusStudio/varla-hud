@@ -15,9 +15,10 @@ from typing import Optional
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QStackedWidget, QStatusBar,
-    QPushButton, QLabel, QFrame,
+    QPushButton, QLabel, QFrame, QDialog, QRadioButton, QButtonGroup,
+    QDialogButtonBox,
 )
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtCore import Qt
 
 from theme import apply_theme, COLORS
@@ -25,12 +26,69 @@ from navigation import NavigationWidget, NAVIGATION_STRUCTURE, TAB_ORDER
 from dual_panel import DualPanelWidget
 from panel_defs import get_columns, extract_items, build_staged_filter
 from models import CharacterData
-from save_dump_parser import parse_save_dump, SaveDumpParser, ClassicSaveDumpParser
+from save_dump_parser import parse_save_dump
 from save_dump_writer import SaveDumpWriter
 from import_window import ImportWindow
 from import_generator import ImportLogGenerator
-from varla_ini_editor import DEFAULT_INI_PATH, parse_ini, write_ini
 import settings as app_settings
+from translations import tr, load_language, set_language, LANGUAGES, current_language
+
+# Default save dump directories per game version
+_DUMP_DIRS = {
+    "classic":    Path.home() / "Documents" / "My Games" / "Oblivion" / "OBSE",
+    "remastered": Path.home() / "Documents" / "My Games" / "Oblivion Remastered" / "OBSE",
+}
+
+
+class GameFormatDialog(QDialog):
+    """Startup dialog to choose between Oblivion versions."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(tr("Select Game Version"))
+        self.setFixedSize(360, 200)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(24, 20, 24, 20)
+
+        title = QLabel(tr("Which version of Oblivion are you using?"))
+        title.setStyleSheet("font-size: 13px; font-weight: bold;")
+        layout.addWidget(title)
+
+        self._group = QButtonGroup(self)
+        saved = app_settings.get("game_format") or "auto"
+
+        self._auto_rb = QRadioButton(tr("Auto-detect"))
+        self._rem_rb = QRadioButton(tr("Oblivion Remastered (obse64)"))
+        self._cls_rb = QRadioButton(tr("Oblivion Classic (xOBSE)"))
+
+        self._group.addButton(self._auto_rb)
+        self._group.addButton(self._rem_rb)
+        self._group.addButton(self._cls_rb)
+
+        if saved == "remastered":
+            self._rem_rb.setChecked(True)
+        elif saved == "classic":
+            self._cls_rb.setChecked(True)
+        else:
+            self._auto_rb.setChecked(True)
+
+        layout.addWidget(self._auto_rb)
+        layout.addWidget(self._rem_rb)
+        layout.addWidget(self._cls_rb)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+    def selected_format(self) -> str:
+        if self._rem_rb.isChecked():
+            return "remastered"
+        if self._cls_rb.isChecked():
+            return "classic"
+        return "auto"
 
 
 class VarlaHUD(QMainWindow):
@@ -40,42 +98,50 @@ class VarlaHUD(QMainWindow):
         self.resize(1400, 900)
 
         app_settings.load()
+        load_language()
 
         self._char_data: Optional[CharacterData] = None
         self._dump_path: Optional[Path] = None
         self._panels: dict[str, DualPanelWidget] = {}
         self._page_map: dict[str, int] = {}
 
+        self._show_format_dialog()
         self._build_menu()
         self._build_ui()
         apply_theme(self)
+
+    def _show_format_dialog(self):
+        dlg = GameFormatDialog(self)
+        dlg.exec()
+        fmt = dlg.selected_format()
+        app_settings.set("game_format", fmt)
 
     # ── Menu ─────────────────────────────────────────────────────────────
 
     def _build_menu(self):
         mb = self.menuBar()
 
-        file_menu = mb.addMenu("&File")
+        file_menu = mb.addMenu(tr("&File"))
 
-        open_act = QAction("&Open Save Dump...", self)
+        open_act = QAction(tr("&Open Save Dump..."), self)
         open_act.setShortcut(QKeySequence.Open)
         open_act.triggered.connect(self._open_dump)
         file_menu.addAction(open_act)
 
-        self._open_default_act = QAction("Open &Default Path", self)
+        self._open_default_act = QAction(tr("Open &Default Path"), self)
         self._open_default_act.setShortcut(QKeySequence("Ctrl+R"))
         self._open_default_act.triggered.connect(self._open_default_dump)
         file_menu.addAction(self._open_default_act)
 
         file_menu.addSeparator()
 
-        self._import_act = QAction("&Import...", self)
+        self._import_act = QAction(tr("&Import..."), self)
         self._import_act.setShortcut(QKeySequence.Save)
         self._import_act.setEnabled(False)
         self._import_act.triggered.connect(self._open_import_window)
         file_menu.addAction(self._import_act)
 
-        self._save_as_act = QAction("Save &As...", self)
+        self._save_as_act = QAction(tr("Save &As..."), self)
         self._save_as_act.setShortcut(QKeySequence("Ctrl+Shift+S"))
         self._save_as_act.setEnabled(False)
         self._save_as_act.triggered.connect(self._save_dump_as)
@@ -83,10 +149,34 @@ class VarlaHUD(QMainWindow):
 
         file_menu.addSeparator()
 
-        quit_act = QAction("&Quit", self)
+        quit_act = QAction(tr("&Quit"), self)
         quit_act.setShortcut(QKeySequence.Quit)
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
+
+        # ── Settings menu ────────────────────────────────────────────────
+        settings_menu = mb.addMenu(tr("&Settings"))
+
+        game_fmt_act = QAction(tr("&Game Version..."), self)
+        game_fmt_act.triggered.connect(self._change_game_format)
+        settings_menu.addAction(game_fmt_act)
+
+        ini_act = QAction(tr("&INI Editor..."), self)
+        ini_act.triggered.connect(self._open_ini_editor)
+        settings_menu.addAction(ini_act)
+
+        # ── Language submenu ──
+        lang_menu = settings_menu.addMenu(tr("&Language"))
+        lang_group = QActionGroup(self)
+        lang_group.setExclusive(True)
+        for code, name in LANGUAGES.items():
+            act = QAction(name, self)
+            act.setCheckable(True)
+            act.setChecked(code == current_language())
+            act.triggered.connect(lambda checked, c=code: self._change_language(c))
+            lang_group.addAction(act)
+            lang_menu.addAction(act)
+
 
     # ── UI ───────────────────────────────────────────────────────────────
 
@@ -114,6 +204,7 @@ class VarlaHUD(QMainWindow):
                 page_key = page["key"]
                 cols = get_columns(page_key)
                 panel = DualPanelWidget(columns=cols)
+                panel.clear_target_requested.connect(self._clear_target)
                 idx = self._stack.addWidget(panel)
                 self._page_map[page_key] = idx
                 self._panels[page_key] = panel
@@ -121,7 +212,7 @@ class VarlaHUD(QMainWindow):
         # Status bar
         self._status = QStatusBar()
         self.setStatusBar(self._status)
-        self._status.showMessage("Open a save dump to begin (File → Open Save Dump).")
+        self._status.showMessage(tr("Open a save dump to begin (File → Open Save Dump)."))
 
         # Show first page
         self._nav.initialize()
@@ -135,7 +226,7 @@ class VarlaHUD(QMainWindow):
         layout.setSpacing(6)
 
         # Default path section
-        path_label = QLabel("Default dump path:")
+        path_label = QLabel(tr("Default dump path:"))
         path_label.setObjectName("options_label")
         layout.addWidget(path_label)
 
@@ -144,13 +235,13 @@ class VarlaHUD(QMainWindow):
         self._default_path_lbl.setMinimumWidth(200)
         layout.addWidget(self._default_path_lbl)
 
-        change_btn = QPushButton("Change...")
+        change_btn = QPushButton(tr("Change..."))
         change_btn.setObjectName("options_btn")
         change_btn.setFixedWidth(70)
         change_btn.clicked.connect(self._change_default_path)
         layout.addWidget(change_btn)
 
-        clear_btn = QPushButton("Clear")
+        clear_btn = QPushButton(tr("Clear"))
         clear_btn.setObjectName("options_btn")
         clear_btn.setFixedWidth(50)
         clear_btn.clicked.connect(self._clear_default_path)
@@ -162,125 +253,93 @@ class VarlaHUD(QMainWindow):
         sep.setObjectName("options_sep")
         layout.addWidget(sep)
 
-        # Game format section
-        fmt_label = QLabel("Game format:")
-        fmt_label.setObjectName("options_label")
-        layout.addWidget(fmt_label)
+        # Import filter toggle
+        filter_lbl = QLabel(tr("Ctrl+S:"))
+        filter_lbl.setObjectName("options_label")
+        layout.addWidget(filter_lbl)
 
-        current_fmt = app_settings.get("game_format") or "auto"
-
-        self._fmt_auto_btn = QPushButton("Auto-detect")
-        self._fmt_auto_btn.setObjectName("options_fmt_btn")
-        self._fmt_auto_btn.setCheckable(True)
-        self._fmt_auto_btn.setFixedWidth(90)
-        self._fmt_auto_btn.clicked.connect(lambda: self._set_game_format("auto"))
-        layout.addWidget(self._fmt_auto_btn)
-
-        self._fmt_rem_btn = QPushButton("Remastered")
-        self._fmt_rem_btn.setObjectName("options_fmt_btn")
-        self._fmt_rem_btn.setCheckable(True)
-        self._fmt_rem_btn.setFixedWidth(90)
-        self._fmt_rem_btn.clicked.connect(lambda: self._set_game_format("remastered"))
-        layout.addWidget(self._fmt_rem_btn)
-
-        self._fmt_cls_btn = QPushButton("Classic (xOBSE)")
-        self._fmt_cls_btn.setObjectName("options_fmt_btn")
-        self._fmt_cls_btn.setCheckable(True)
-        self._fmt_cls_btn.setFixedWidth(120)
-        self._fmt_cls_btn.clicked.connect(lambda: self._set_game_format("classic"))
-        layout.addWidget(self._fmt_cls_btn)
-
-        self._update_format_buttons(current_fmt)
-
-        # Separator
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.VLine)
-        sep2.setObjectName("options_sep")
-        layout.addWidget(sep2)
-
-        # [SaveDump] export master toggle
-        export_lbl = QLabel("[SaveDump]")
-        export_lbl.setObjectName("options_label")
-        layout.addWidget(export_lbl)
-
-        self._export_toggle_btn = QPushButton("Export: ON")
+        skip = bool(app_settings.get("skip_import_filter"))
+        self._export_toggle_btn = QPushButton(tr("Direct Save") if skip else tr("Import Filter"))
         self._export_toggle_btn.setObjectName("options_export_btn")
         self._export_toggle_btn.setCheckable(True)
-        self._export_toggle_btn.setFixedWidth(100)
+        self._export_toggle_btn.setChecked(skip)
+        self._export_toggle_btn.setFixedWidth(110)
         self._export_toggle_btn.setToolTip(
-            "bExportEnabled in varla.ini — master switch.\n"
-            "OFF prevents any dump from being written on save,\n"
-            "protecting your existing save_dump.txt."
+            tr("Import Filter: Ctrl+S opens the Import window to\n"
+            "select which staged items to export to target.txt.\n\n"
+            "Direct Save: Ctrl+S writes all staged items directly\n"
+            "to target.txt without the Import window.")
         )
-        self._export_toggle_btn.clicked.connect(self._toggle_export_enabled)
+        self._export_toggle_btn.clicked.connect(self._toggle_skip_filter)
         layout.addWidget(self._export_toggle_btn)
-        self._refresh_export_btn()
 
         layout.addStretch()
         return bar
 
+    def _dump_path_key(self) -> str:
+        """Return the settings key for the default dump path based on game format."""
+        fmt = app_settings.get("game_format") or "auto"
+        if fmt == "classic":
+            return "default_dump_path_classic"
+        if fmt == "remastered":
+            return "default_dump_path_remastered"
+        return "default_dump_path"
+
     def _get_default_path_display(self) -> str:
-        p = app_settings.get("default_dump_path") or ""
+        p = app_settings.get(self._dump_path_key()) or ""
         return p if p else "(not set)"
 
     def _change_default_path(self):
-        current = app_settings.get("default_dump_path") or ""
+        current = app_settings.get(self._dump_path_key()) or ""
         start = str(Path(current).parent) if current else ""
         path, _ = QFileDialog.getOpenFileName(
             self, "Set Default Dump Path", start, "Text Files (*.txt);;All Files (*)"
         )
         if path:
-            app_settings.set("default_dump_path", path)
+            app_settings.set(self._dump_path_key(), path)
             self._default_path_lbl.setText(path)
 
     def _clear_default_path(self):
-        app_settings.set("default_dump_path", "")
+        app_settings.set(self._dump_path_key(), "")
         self._default_path_lbl.setText("(not set)")
 
-    def _refresh_export_btn(self):
-        try:
-            values = parse_ini(DEFAULT_INI_PATH)
-            enabled = values.get("bExportEnabled", 1) == 1
-        except Exception:
-            enabled = True
-        self._export_toggle_btn.setChecked(enabled)
-        self._export_toggle_btn.setText("Export: ON" if enabled else "Export: OFF")
+    def _toggle_skip_filter(self, checked: bool):
+        app_settings.set("skip_import_filter", checked)
+        self._export_toggle_btn.setText(tr("Direct Save") if checked else tr("Import Filter"))
 
-    def _toggle_export_enabled(self, checked: bool):
-        self._export_toggle_btn.setText("Export: ON" if checked else "Export: OFF")
-        try:
-            values = parse_ini(DEFAULT_INI_PATH)
-            values["bExportEnabled"] = 1 if checked else 0
-            write_ini(DEFAULT_INI_PATH, values)
-        except Exception as e:
-            self._status.showMessage(f"Could not update varla.ini: {e}", 5000)
+    def _change_game_format(self):
+        dlg = GameFormatDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            fmt = dlg.selected_format()
+            app_settings.set("game_format", fmt)
+            self._default_path_lbl.setText(self._get_default_path_display())
+            if self._dump_path:
+                self._reload_dump_with_format(fmt)
 
-    def _set_game_format(self, fmt: str):
-        app_settings.set("game_format", fmt)
-        self._update_format_buttons(fmt)
-        if self._dump_path:
-            self._reload_dump_with_format(fmt)
+    def _change_language(self, lang_code: str):
+        set_language(lang_code)
+        QMessageBox.information(
+            self, "Language",
+            "Language changed. Please restart the application for the change to take full effect."
+        )
 
-    def _update_format_buttons(self, fmt: str):
-        self._fmt_auto_btn.setChecked(fmt == "auto")
-        self._fmt_rem_btn.setChecked(fmt == "remastered")
-        self._fmt_cls_btn.setChecked(fmt == "classic")
+    def _open_ini_editor(self):
+        import subprocess, sys as _sys
+        editor_path = Path(__file__).parent / "varla_ini_editor.py"
+        subprocess.Popen([_sys.executable, str(editor_path)])
 
     def _reload_dump_with_format(self, fmt: str):
         try:
-            if fmt == "classic":
-                char_data = ClassicSaveDumpParser(self._dump_path).parse()
-            elif fmt == "remastered":
-                char_data = SaveDumpParser(self._dump_path).parse()
-            else:
-                char_data = parse_save_dump(self._dump_path)
+            char_data = parse_save_dump(self._dump_path)
         except Exception as e:
-            QMessageBox.critical(self, "Parse Error", f"Failed to re-parse with {fmt} format:\n{e}")
+            QMessageBox.critical(self, "Parse Error", f"Failed to re-parse:\n{e}")
             return
+        if fmt != "auto":
+            char_data.dump_format = fmt
         self._char_data = char_data
         self._populate_all_panels()
         self._status.showMessage(
-            f"Reloaded: {self._dump_path.name}  [{char_data.dump_format or fmt}]"
+            f"Reloaded: {self._dump_path.name}  [{char_data.dump_format}]"
         )
 
     # ── Navigation ───────────────────────────────────────────────────────
@@ -293,8 +352,16 @@ class VarlaHUD(QMainWindow):
     # ── File operations ──────────────────────────────────────────────────
 
     def _open_default_dump(self):
-        path = app_settings.get("default_dump_path") or ""
+        path = app_settings.get(self._dump_path_key()) or ""
         if not path or not Path(path).exists():
+            # Fall back to format-appropriate save_dump.txt
+            fmt = app_settings.get("game_format") or "auto"
+            fmt_dir = _DUMP_DIRS.get(fmt)
+            if fmt_dir:
+                candidate = fmt_dir / "save_dump.txt"
+                if candidate.exists():
+                    self._load_path(str(candidate))
+                    return
             QMessageBox.warning(
                 self, "No Default Path",
                 "No default dump path is set or the file no longer exists.\n"
@@ -304,8 +371,18 @@ class VarlaHUD(QMainWindow):
         self._load_path(path)
 
     def _open_dump(self):
-        default = app_settings.get("default_dump_path") or ""
-        start_dir = str(Path(default).parent) if default else ""
+        # Pick start directory: format-specific OBSE dir takes priority,
+        # fall back to saved default dump path
+        fmt = app_settings.get("game_format") or "auto"
+        fmt_dir = _DUMP_DIRS.get(fmt)
+        if fmt_dir and fmt_dir.exists():
+            start_dir = str(fmt_dir)
+        else:
+            default = app_settings.get(self._dump_path_key()) or ""
+            if default and Path(default).parent.exists():
+                start_dir = str(Path(default).parent)
+            else:
+                start_dir = ""
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Save Dump", start_dir, "Text Files (*.txt);;All Files (*)"
         )
@@ -314,25 +391,31 @@ class VarlaHUD(QMainWindow):
         self._load_path(path)
 
     def _load_path(self, path: str):
-        fmt = app_settings.get("game_format") or "auto"
         try:
-            if fmt == "classic":
-                char_data = ClassicSaveDumpParser(Path(path)).parse()
-            elif fmt == "remastered":
-                char_data = SaveDumpParser(Path(path)).parse()
-            else:
-                char_data = parse_save_dump(Path(path))
+            char_data = parse_save_dump(Path(path))
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to parse save dump:\n{e}")
             return
+
+        # If user chose a specific game version, override the detected format
+        # so the writer produces the correct output
+        fmt = app_settings.get("game_format") or "auto"
+        if fmt != "auto":
+            char_data.dump_format = fmt
 
         self._char_data = char_data
         self._dump_path = Path(path)
         self._populate_all_panels()
 
+        # Auto-set default dump path if not configured yet for this format
+        key = self._dump_path_key()
+        if not app_settings.get(key):
+            app_settings.set(key, path)
+            self._default_path_lbl.setText(path)
+
         self._import_act.setEnabled(True)
         self._save_as_act.setEnabled(True)
-        detected = char_data.dump_format or fmt
+        detected = char_data.dump_format or "auto"
         self._status.showMessage(f"Loaded: {path}  [{detected}]")
         self.setWindowTitle(f"Varla-HUD — {Path(path).name}")
 
@@ -346,6 +429,12 @@ class VarlaHUD(QMainWindow):
     def _open_import_window(self):
         if not self._char_data or not self._dump_path:
             return
+
+        # Check if user wants to skip the import filter and save directly
+        if app_settings.get("skip_import_filter"):
+            self._save_dump()
+            return
+
         # Collect all staged PanelItems from the main panels (deduped by uid)
         staged: list = []
         seen: set = set()
@@ -355,7 +444,6 @@ class VarlaHUD(QMainWindow):
                     seen.add(pi.uid)
                     staged.append(pi)
         if not staged:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.information(
                 self, "Nothing staged",
                 "Stage some items in the main panels first, then open Import."
@@ -369,7 +457,11 @@ class VarlaHUD(QMainWindow):
             self._save_dump_as()
             return
         target_path = self._dump_path.parent / "target.txt"
-        if self._char_data and self._char_data.dump_format == "classic":
+        # Use ImportLogGenerator only for legacy --- --- format dumps;
+        # modern xOBSE (=== ===) uses SaveDumpWriter like remastered
+        raw = (self._char_data.raw_dump_text or "") if self._char_data else ""
+        is_legacy = self._char_data and self._char_data.dump_format == "classic" and "=== " not in raw[:500]
+        if is_legacy:
             self._save_dump_classic(target_path)
         else:
             self._do_save(target_path)
@@ -475,6 +567,20 @@ class VarlaHUD(QMainWindow):
             self._status.showMessage(f"Saved: {output_path}")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save:\n{e}")
+
+
+    def _clear_target(self):
+        fmt = app_settings.get("game_format") or "classic"
+        target_dir = _DUMP_DIRS.get(fmt)
+        if not target_dir:
+            self._status.showMessage("Unknown game format — cannot determine target path.")
+            return
+        target_path = target_dir / "target.txt"
+        try:
+            target_path.write_text("", encoding="utf-8")
+            self._status.showMessage(f"Cleared: {target_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Clear Target Error", f"Failed to clear target:\n{e}")
 
 
 def main():
