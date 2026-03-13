@@ -259,7 +259,7 @@ SETTING_GROUPS = {
             ("bDumpExtraDataTypes", "Extra Data Types", "All ExtraData entries on the player"),
             ("bDumpPlayerExtraDetail", "Player Extra Detail", "Decoded ExtraData with field names"),
             ("bDumpNPCRawData", "NPC Raw Data", "Raw data for nearby NPCs"),
-            ("bDumpAppearanceData", "Appearance Data", "Player appearance/race/body data from save"),
+            ("bDumpAppearance", "Appearance Data", "Player appearance/race/body data from save"),
         ],
     },
     "Weather / Climate": {
@@ -415,10 +415,33 @@ PRESETS = {
 # INI File Parser
 # ---------------------------------------------------------------------------
 
-DEFAULT_INI_PATH = (
-    r"E:\SteamLibrary\steamapps\common\Oblivion Remastered"
-    r"\OblivionRemastered\Binaries\Win64\OBSE\varla.ini"
-)
+_INI_PATHS = {
+    "classic": Path.home() / "Documents" / "My Games" / "Oblivion" / "OBSE" / "varla.ini",
+    "remastered": (
+        Path(r"E:\SteamLibrary\steamapps\common\Oblivion Remastered")
+        / "OblivionRemastered" / "Binaries" / "Win64" / "OBSE" / "varla.ini"
+    ),
+}
+
+
+def _default_ini_path(game_format: str | None = None) -> str:
+    """Return the varla.ini path based on game format.
+
+    Falls back to whichever path actually exists on disk.
+    """
+    if game_format in _INI_PATHS:
+        p = _INI_PATHS[game_format]
+        if p.exists():
+            return str(p)
+    # Try both paths, return whichever exists
+    for p in _INI_PATHS.values():
+        if p.exists():
+            return str(p)
+    # Nothing found — return classic as default
+    return str(_INI_PATHS["classic"])
+
+
+DEFAULT_INI_PATH = _default_ini_path()
 
 
 def parse_ini(path: str) -> dict[str, int]:
@@ -1013,7 +1036,15 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Varla INI Editor")
 
-    window = VarlaIniEditor()
+    # Accept --format classic|remastered to pick the right varla.ini
+    game_format = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--format" and i + 1 < len(sys.argv):
+            game_format = sys.argv[i + 1]
+            break
+
+    ini_path = _default_ini_path(game_format)
+    window = VarlaIniEditor(ini_path=ini_path)
     window.show()
     sys.exit(app.exec())
 

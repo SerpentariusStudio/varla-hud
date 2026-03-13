@@ -102,6 +102,21 @@ class SaveDumpWriter:
 
         self._sf = staged_filter
         lines = self.raw_text.splitlines()
+
+        # Auto-detect actual content format from delimiter style.
+        # Modern xOBSE (classic game) uses === === headers with remastered-style
+        # field formatting (e.g. "Base:" not "base:"), so regex patterns must
+        # match the actual content regardless of the user's game_format setting.
+        has_triple_equals = any(
+            re.match(r'^=== [A-Z].+ ===$', ln.strip()) for ln in lines[:100]
+        )
+        if has_triple_equals:
+            self.format = "remastered"
+
+        # Generate missing sections that the user staged but aren't in the dump
+        if staged_filter:
+            lines = self._inject_missing_sections(lines, staged_filter)
+
         sections = self._index_sections(lines)
 
         if staged_filter:
@@ -134,9 +149,10 @@ class SaveDumpWriter:
 
     def _index_sections(self, lines: List[str]) -> Dict[str, tuple]:
         """Build section name -> (start_line, end_line) index."""
-        # Detect delimiter from actual raw text (modern xOBSE uses === ===)
-        has_triple_equals = any(re.match(r'^=== [A-Z].+ ===$', ln.strip()) for ln in lines[:100])
-        if has_triple_equals:
+        # Use self.format (set during write()) to pick the right delimiter.
+        # Scanning only lines[:100] broke after _remove_sections_by_filter
+        # deleted early sections, pushing surviving headers past line 100.
+        if self.format == "remastered":
             pattern = re.compile(r'^=== (.+?) ===$')
         else:
             pattern = re.compile(r'^--- (.+?) ---$')
@@ -156,6 +172,63 @@ class SaveDumpWriter:
             sections[name] = (start, end)
 
         return sections
+
+    def _inject_missing_sections(self, lines: List[str], sf: "StagedFilter") -> List[str]:
+        """Generate sections that the user staged but aren't in the raw dump.
+
+        The xOBSE dump may not include every section (controlled by varla.ini).
+        When the user stages data from a section that wasn't dumped, we need to
+        synthesize that section so the writer can produce valid output.
+        """
+        sections = self._index_sections(lines)
+        new_sections: List[str] = []
+        delim = "===" if self.format == "remastered" else "---"
+
+        # Attributes
+        attr_names = {"ATTRIBUTES", "Attributes"}
+        if sf.attribute_names and not any(n in sections for n in attr_names):
+            sec_name = "ATTRIBUTES" if self.format == "remastered" else "Attributes"
+            new_sections.append(f"{delim} {sec_name} {delim}")
+            new_sections.append("Format: Current (Base)")
+            for attr in ATTRIBUTE_NAMES:
+                if attr in self.data.attributes:
+                    val = self.data.attributes[attr]
+                    cur = self.data.skills_current.get(attr, val)
+                    if self.format == "remastered":
+                        new_sections.append(f"  {attr}: {cur} (Base: {val})")
+                    else:
+                        new_sections.append(f"  {attr}: {cur} (base: {val})")
+            new_sections.append("")
+
+        # Skills
+        skill_names = {"SKILLS", "Skills"}
+        if sf.skill_names and not any(n in sections for n in skill_names):
+            sec_name = "SKILLS" if self.format == "remastered" else "Skills"
+            new_sections.append(f"{delim} {sec_name} {delim}")
+            new_sections.append("Format: Current (Base)")
+            for skill in SKILL_NAMES:
+                if skill in self.data.skills:
+                    val = self.data.skills[skill]
+                    cur = self.data.skills_current.get(skill, val)
+                    display = get_skill_display_name(skill)
+                    if self.format == "remastered":
+                        new_sections.append(f"  {display}: {cur} (Base: {val})")
+                    else:
+                        new_sections.append(f"  {display}: {cur} (base: {val})")
+            new_sections.append("")
+
+        if not new_sections:
+            return lines
+
+        # Insert before the END marker or at the end
+        insert_pos = len(lines)
+        for i, line in enumerate(lines):
+            if "END OF SAVE DATA DUMP" in line:
+                # Go back past the === line
+                insert_pos = max(0, i - 1)
+                break
+
+        return lines[:insert_pos] + new_sections + lines[insert_pos:]
 
     def _remove_sections_by_filter(self, lines: List[str], sections: Dict, sf: "StagedFilter") -> List[str]:
         """Mark entire sections for deletion based on StagedFilter flags/sets."""
@@ -383,7 +456,7 @@ class SaveDumpWriter:
                     if current_is_excepted:
                         lines[i] = _DELETED_LINE
                     elif current_spell:
-                        cost_m = re.search(r'(Cost:\s*)\d+', line)
+                        cost_m = re.search(r'(Cost:\s*)[\d.]+', line)
                         if cost_m:
                             lines[i] = line[:cost_m.start()] + f"Cost: {current_spell.magicka_cost}" + line[cost_m.end():]
                     continue
@@ -480,8 +553,8 @@ class SaveDumpWriter:
             return lines
 
         start, end = rng
-        # Build name mapping for classic format
-        classic_name_map = {
+        # Map multi-word display names (as they appear in the dump) to storage names
+        display_to_storage = {
             "Hand To Hand": "HandToHand",
             "Heavy Armor": "HeavyArmor",
             "Light Armor": "LightArmor",
@@ -496,10 +569,11 @@ class SaveDumpWriter:
                 continue
 
             if self.format == "remastered":
-                # "  Armorer: 34 (Base: 34)"
-                m = re.match(r'(\s*\w+:\s*)\d+(\s*\(Base:\s*)\d+(\).*)', line)
+                # "  Armorer: 34 (Base: 34)" or "  Hand To Hand: 13 (Base: 13)"
+                m = re.match(r'(\s*[\w ]+?:\s*)\d+(\s*\(Base:\s*)\d+(\).*)', line)
                 if m:
-                    skill_name = line.strip().split(":")[0].strip()
+                    skill_display = line.strip().split(":")[0].strip()
+                    skill_name = display_to_storage.get(skill_display, skill_display)
                     if self._sf and self._sf.skill_names and skill_name not in self._sf.skill_names:
                         lines[i] = _DELETED_LINE
                         continue
@@ -512,7 +586,7 @@ class SaveDumpWriter:
                 m = re.match(r'(\s*[\w\s]+?\s*:\s*)\d+(\s*\(base:\s*)\d+(\).*)', line)
                 if m:
                     skill_display = line.strip().split(":")[0].strip()
-                    skill_name = classic_name_map.get(skill_display, skill_display)
+                    skill_name = display_to_storage.get(skill_display, skill_display)
                     if self._sf and self._sf.skill_names and skill_name not in self._sf.skill_names:
                         lines[i] = _DELETED_LINE
                         continue

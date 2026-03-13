@@ -326,7 +326,11 @@ class VarlaHUD(QMainWindow):
     def _open_ini_editor(self):
         import subprocess, sys as _sys
         editor_path = Path(__file__).parent / "varla_ini_editor.py"
-        subprocess.Popen([_sys.executable, str(editor_path)])
+        fmt = app_settings.get("game_format") or "auto"
+        cmd = [_sys.executable, str(editor_path)]
+        if fmt in ("classic", "remastered"):
+            cmd += ["--format", fmt]
+        subprocess.Popen(cmd)
 
     def _reload_dump_with_format(self, fmt: str):
         try:
@@ -432,6 +436,12 @@ class VarlaHUD(QMainWindow):
 
         # Check if user wants to skip the import filter and save directly
         if app_settings.get("skip_import_filter"):
+            # Warn if nothing is staged
+            if not any(p.get_staged_items() for p in self._panels.values()):
+                QMessageBox.information(
+                    self, tr("Nothing staged"),
+                    tr("Stage some items in the right panel first, then press Ctrl+S."))
+                return
             self._save_dump()
             return
 
@@ -458,7 +468,7 @@ class VarlaHUD(QMainWindow):
             return
         target_path = self._dump_path.parent / "target.txt"
         # Use ImportLogGenerator only for legacy --- --- format dumps;
-        # modern xOBSE (=== ===) uses SaveDumpWriter like remastered
+        # modern xOBSE (=== ===) uses SaveDumpWriter (dump format target.txt)
         raw = (self._char_data.raw_dump_text or "") if self._char_data else ""
         is_legacy = self._char_data and self._char_data.dump_format == "classic" and "=== " not in raw[:500]
         if is_legacy:
@@ -570,12 +580,16 @@ class VarlaHUD(QMainWindow):
 
 
     def _clear_target(self):
-        fmt = app_settings.get("game_format") or "classic"
-        target_dir = _DUMP_DIRS.get(fmt)
-        if not target_dir:
-            self._status.showMessage("Unknown game format — cannot determine target path.")
-            return
-        target_path = target_dir / "target.txt"
+        # Derive target path from loaded dump (same logic as _save_dump)
+        if self._dump_path:
+            target_path = self._dump_path.parent / "target.txt"
+        else:
+            fmt = app_settings.get("game_format") or "classic"
+            target_dir = _DUMP_DIRS.get(fmt)
+            if not target_dir:
+                self._status.showMessage(tr("No dump loaded and game format is auto — cannot determine target path."))
+                return
+            target_path = target_dir / "target.txt"
         try:
             target_path.write_text("", encoding="utf-8")
             self._status.showMessage(f"Cleared: {target_path}")
