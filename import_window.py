@@ -26,27 +26,39 @@ from translations import tr
 # ── Categories shown in order ─────────────────────────────────────────────────
 
 _CATEGORIES = [
-    ("char_info",        "CHARACTER INFO"),
-    ("all_items",        "INVENTORY"),
-    ("spell_all",        "SPELLS"),
-    ("active_quests",    "ACTIVE QUESTS"),
-    ("completed_quests", "COMPLETED QUESTS"),
-    ("skills",           "SKILLS"),
-    ("attributes",       "ATTRIBUTES"),
-    ("factions",         "FACTIONS"),
-    ("globals",          "GLOBAL VARIABLES"),
+    ("char_info",            "CHARACTER INFO"),
+    ("details",              "CHARACTER DETAILS"),
+    ("all_items",            "INVENTORY"),
+    ("spell_all",            "SPELLS"),
+    ("magic_active_effects", "ACTIVE MAGIC EFFECTS"),
+    ("active_quests",        "ACTIVE QUESTS"),
+    ("completed_quests",     "COMPLETED QUESTS"),
+    ("quest_vars",           "QUEST VARIABLES"),
+    ("skills",               "SKILLS"),
+    ("attributes",           "ATTRIBUTES"),
+    ("factions",             "FACTIONS"),
+    ("globals",              "GLOBAL VARIABLES"),
+    ("game_time",            "GAME TIME"),
+    ("world_state",          "WORLD STATE"),
+    ("plugins",              "PLUGINS"),
 ]
 
 _UID_TO_CAT = {
     "ci.":       "CHARACTER INFO",
+    "detail.":   "CHARACTER DETAILS",
     "inv.":      "INVENTORY",
     "spell.":    "SPELLS",
+    "ame.":      "ACTIVE MAGIC EFFECTS",
     "aq.":       "ACTIVE QUESTS",
     "cq.":       "COMPLETED QUESTS",
+    "sq.":       "QUEST VARIABLES",
     "skill.":    "SKILLS",
     "attr.":     "ATTRIBUTES",
     "faction.":  "FACTIONS",
     "gv.":       "GLOBAL VARIABLES",
+    "gt.":       "GAME TIME",
+    "ws.":       "WORLD STATE",
+    "plugin.":   "PLUGINS",
 }
 
 
@@ -83,6 +95,19 @@ def _item_columns(pi) -> tuple:
         return v.get("name", ""), f"Rank {v.get('rank', '')}", v.get("form_id", "")
     if uid.startswith("gv."):
         return v.get("name", ""), str(v.get("value", "")), v.get("form_id", "")
+    if uid.startswith("detail."):
+        return v.get("field", ""), str(v.get("value", "")), v.get("category", "")
+    if uid.startswith("ame."):
+        return v.get("effect", ""), f"Mag {v.get('magnitude', '')}  Dur {v.get('duration', '')}", v.get("source", "")
+    if uid.startswith("sq."):
+        name = v.get("name", "") or v.get("editor_id", "")
+        return name, f"{v.get('status', '')} · {v.get('__vars__', '0')} vars", v.get("form_id", "")
+    if uid.startswith("gt."):
+        return v.get("field", ""), str(v.get("value", "")), ""
+    if uid.startswith("ws."):
+        return v.get("field", ""), str(v.get("value", "")), v.get("category", "")
+    if uid.startswith("plugin."):
+        return v.get("name", ""), f"Index {v.get('index', '')}", ""
     return v.get("name", uid), "", ""
 
 
@@ -425,18 +450,30 @@ class ImportWindow(QDialog):
 
     def _write_target(self):
         staged = self._staged_uids()
-        if not staged:
+        # Allow writing if the only thing the user changed is a quest script
+        # var (edited via the Vars dialog) — those don't appear as a staged
+        # row but they're meaningful changes.
+        has_dirty_vars = any(
+            any(v.is_dirty for v in vlist)
+            for vlist in self._char_data.quest_script_vars.values()
+        )
+        if not staged and not has_dirty_vars:
             QMessageBox.information(
                 self, "Nothing staged",
-                "Move at least one item to the right panel first."
+                "Move at least one item to the right panel first, "
+                "or edit a quest's script variables."
             )
             return
 
         sf = WriterSF()
         cq_sources = []
-        skill_items: dict = {}   # storage_name -> PanelItem
-        attr_items:  dict = {}   # attr_name     -> PanelItem
-        ci_items:    dict = {}   # field key     -> PanelItem
+        skill_items: dict = {}    # storage_name -> PanelItem
+        attr_items:  dict = {}    # attr_name     -> PanelItem
+        ci_items:    dict = {}    # field key     -> PanelItem
+        detail_items: list = []   # PanelItems for character details
+        gt_items:    list = []    # PanelItems for game time
+        ws_items:    list = []    # PanelItems for world state
+        ame_sources: list = []    # active magic effect source objects
 
         _BASIC_CHAR_KEYS = {"name", "race", "class_name", "birthsign", "level", "sex"}
         for uid in staged:
@@ -452,10 +489,30 @@ class ImportWindow(QDialog):
                     ci_items[key] = pi
             elif uid.startswith("inv."):
                 if fid: sf.inventory_ids.add(fid)
+                # Sync inline edits (qty / condition / charge) onto the source
+                if pi and pi.source:
+                    try: pi.source.quantity = int(pi.values.get("qty", pi.source.quantity))
+                    except (ValueError, TypeError): pass
+                    for src_attr, key in [
+                        ("condition_current", "cond_cur"),
+                        ("condition_max",     "cond_max"),
+                        ("enchant_current",   "chrg_cur"),
+                        ("enchant_max",       "chrg_max"),
+                    ]:
+                        raw = pi.values.get(key, "")
+                        if raw != "":
+                            try: setattr(pi.source, src_attr, float(raw))
+                            except (ValueError, TypeError): pass
             elif uid.startswith("spell."):
                 if fid: sf.spell_ids.add(fid)
+                if pi and pi.source:
+                    try: pi.source.magicka_cost = int(pi.values.get("cost", pi.source.magicka_cost))
+                    except (ValueError, TypeError): pass
             elif uid.startswith("aq."):
                 if fid: sf.active_quest_ids.add(fid)
+                if pi and pi.source:
+                    try: pi.source.stage = int(pi.values.get("stage", pi.source.stage))
+                    except (ValueError, TypeError): pass
             elif uid.startswith("cq."):
                 if pi and pi.source:
                     cq_sources.append(pi.source)
@@ -469,8 +526,34 @@ class ImportWindow(QDialog):
                 if pi: attr_items[name] = pi
             elif uid.startswith("faction."):
                 if fid: sf.faction_ids.add(fid)
+                if pi and pi.source:
+                    try: pi.source.rank = int(pi.values.get("rank", pi.source.rank))
+                    except (ValueError, TypeError): pass
             elif uid.startswith("gv."):
                 if fid: sf.global_ids.add(fid)
+                if pi and pi.source:
+                    try: pi.source.value = float(pi.values.get("value", pi.source.value))
+                    except (ValueError, TypeError): pass
+            elif uid.startswith("detail."):
+                sf.include_details = True
+                if pi: detail_items.append(pi)
+            elif uid.startswith("ame."):
+                sf.include_active_effects = True
+                if pi and pi.source: ame_sources.append(pi.source)
+            elif uid.startswith("sq."):
+                # Quest variable rows: marking the quest as included.
+                # Vars themselves only get written if they were edited via
+                # the dialog (is_dirty is true) — see auto-stage scan below.
+                if fid: sf.quest_script_var_ids.add(fid)
+            elif uid.startswith("gt."):
+                sf.include_game_time = True
+                if pi: gt_items.append(pi)
+            elif uid.startswith("ws."):
+                sf.include_world_state = True
+                if pi: ws_items.append(pi)
+            elif uid.startswith("plugin."):
+                try: sf.plugin_indices.add(int(pi.values.get("index", -1)) if pi else -1)
+                except (ValueError, TypeError): pass
 
         # Sync edited base/current values into char_data so the writer uses them
         if skill_items:
@@ -520,6 +603,107 @@ class ImportWindow(QDialog):
         if cq_sources:
             sf.include_completed_quests = True
             self._char_data.completed_quests_enriched = cq_sources
+
+        if ame_sources:
+            self._char_data.active_magic_effects = ame_sources
+
+        # Sync edited details back onto vitals / resistances / pc_misc_stats.
+        # Mirrors the dispatch in panel_defs.build_staged_filter so the Import
+        # window honours inline edits made on the Details panel.
+        if detail_items:
+            v = self._char_data.vitals
+            r = self._char_data.magic_resistances
+            cd = self._char_data
+            mapping = {
+                "health_cur":   ("vitals", "health_current",  float),
+                "health_base":  ("vitals", "health_base",     float),
+                "magicka_cur":  ("vitals", "magicka_current", float),
+                "magicka_base": ("vitals", "magicka_base",    float),
+                "fatigue_cur":  ("vitals", "fatigue_current", float),
+                "fatigue_base": ("vitals", "fatigue_base",    float),
+                "encumbrance":  ("vitals", "encumbrance",     float),
+                "fame":         ("char",   "fame",            int),
+                "infamy":       ("char",   "infamy",          int),
+                "bounty":       ("char",   "bounty",          int),
+                "res_fire":     ("res",    "fire",            float),
+                "res_frost":    ("res",    "frost",           float),
+                "res_shock":    ("res",    "shock",           float),
+                "res_magic":    ("res",    "magic",           float),
+                "res_disease":  ("res",    "disease",         float),
+                "res_poison":   ("res",    "poison",          float),
+                "res_para":     ("res",    "paralysis",       float),
+                "res_normal":   ("res",    "normal_weapons",  float),
+            }
+            obj_for = {"vitals": v, "res": r, "char": cd}
+            for pi in detail_items:
+                key = pi.uid[7:]   # strip "detail."
+                raw = pi.values.get("value", "")
+                if key in mapping:
+                    target, attr, conv = mapping[key]
+                    try:
+                        setattr(obj_for[target], attr, conv(float(raw)))
+                    except (ValueError, TypeError):
+                        pass
+                elif key.startswith("misc_"):
+                    try:
+                        idx = int(key[5:])
+                        cd.pc_misc_stats[idx] = int(float(raw))
+                    except (ValueError, TypeError):
+                        pass
+
+        if gt_items:
+            gt = self._char_data.game_time
+            for pi in gt_items:
+                key = pi.uid[3:]   # strip "gt."
+                try:
+                    val = float(pi.values.get("value", 0))
+                    if key == "days_passed": gt.days_passed = val
+                    elif key == "game_year":  gt.game_year  = int(val)
+                    elif key == "game_month": gt.game_month = int(val)
+                    elif key == "game_day":   gt.game_day   = int(val)
+                    elif key == "game_hour":  gt.game_hour  = val
+                except (ValueError, TypeError):
+                    pass
+
+        if ws_items:
+            pos = self._char_data.player_position
+            w = self._char_data.weather
+            for pi in ws_items:
+                key = pi.uid[3:]   # strip "ws."
+                raw = pi.values.get("value", "")
+                # Numeric fields first
+                try:
+                    val_f = float(raw)
+                    if key == "x":       pos.x = val_f; continue
+                    elif key == "y":     pos.y = val_f; continue
+                    elif key == "z":     pos.z = val_f; continue
+                    elif key == "rot_x": pos.rot_x = val_f; continue
+                    elif key == "rot_y": pos.rot_y = val_f; continue
+                    elif key == "rot_z": pos.rot_z = val_f; continue
+                    elif key == "scale": pos.scale = val_f; continue
+                except (ValueError, TypeError):
+                    pass
+                # String fields
+                if key == "cell":          pos.parent_cell         = raw
+                elif key == "cell_fid":    pos.parent_cell_form_id = raw
+                elif key == "weather":     w.current_weather       = raw
+                elif key == "weather_fid": w.current_weather_form_id = raw
+                elif key == "climate_fid": w.climate_form_id       = raw
+
+        # Quest-var auto-include policy:
+        #   - If the user was offered any sq. rows in the Import window
+        #     (i.e., any quest_vars row was staged in the main window),
+        #     RESPECT their explicit staging — only the rows on the right
+        #     panel get included. The dispatch loop above already added
+        #     them to sf.quest_script_var_ids.
+        #   - Only when no sq. row is present at all (the user edited a var
+        #     via the dialog without ever staging the quest) do we auto-
+        #     include the quest so dialog edits don't silently disappear.
+        sq_was_offered = any(uid.startswith("sq.") for uid in self._all_items)
+        if not sq_was_offered:
+            for fid, vlist in self._char_data.quest_script_vars.items():
+                if any(v.is_dirty for v in vlist):
+                    sf.quest_script_var_ids.add(fid)
 
         target_path = self._dump_path.parent / "target.txt"
         try:

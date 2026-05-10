@@ -187,15 +187,25 @@ QPushButton#exportToggleBtn:hover {{
 
 # Each entry: (ini_key, friendly_name, description)
 SETTING_GROUPS = {
+    "Master Toggle": {
+        "description": "Top-level switch that gates the entire export. "
+                       "Set OFF to protect an existing save_dump.txt from being overwritten on save.",
+        "icon": "M",
+        "settings": [
+            ("bExportEnabled", "Export Enabled",
+             "Master gate: when OFF, no dump is written on save (protects an existing save_dump.txt). "
+             "Import always reads target.txt regardless of this flag."),
+        ],
+    },
     "Player Character Data": {
         "description": "Core character info included in every save dump. "
                        "Most of these should stay ON for Varla-HUD to work.",
         "icon": "C",  # placeholder for a future icon
         "settings": [
-            ("bDumpSaveFormat", "Save Format", "Include save file format version"),
+            # Order mirrors Hooks_Save.cpp's varla.ini auto-generation
+            ("bDumpCharacterInfo", "Character Info", "Health, magicka, fatigue, bounty, etc."),
             ("bDumpPlayerCharacter", "Player Character", "Name, race, class, level, and base info"),
             ("bDumpPosition", "Position", "World coordinates, cell, and facing direction"),
-            ("bDumpCharacterInfo", "Character Info", "Health, magicka, fatigue, bounty, etc."),
             ("bDumpFameInfamy", "Fame & Infamy", "Current fame and infamy values"),
             ("bDumpGameTime", "Game Time", "In-game date, time, and play duration"),
             ("bDumpGlobalVars", "Global Variables", "Story-tracking global script variables"),
@@ -228,6 +238,7 @@ SETTING_GROUPS = {
                        "or developing tools. Safe to leave OFF.",
         "icon": "S",
         "settings": [
+            ("bDumpSaveFormat", "Save Format", "Raw save-file section headers, sizes, and offsets"),
             ("bDumpDetailedGlobalData", "Detailed Global Data", "Raw global data tables from the save"),
             ("bDumpChangedForms", "Changed Forms", "All modified game objects since last save"),
             ("bDumpCreatedForms", "Created Forms", "Dynamically created objects (enchanted items, etc.)"),
@@ -259,7 +270,8 @@ SETTING_GROUPS = {
             ("bDumpExtraDataTypes", "Extra Data Types", "All ExtraData entries on the player"),
             ("bDumpPlayerExtraDetail", "Player Extra Detail", "Decoded ExtraData with field names"),
             ("bDumpNPCRawData", "NPC Raw Data", "Raw data for nearby NPCs"),
-            ("bDumpAppearance", "Appearance Data", "Player appearance/race/body data from save"),
+            ("bDumpAppearanceData", "Appearance Data",
+             "Hair / eyes / FaceGen morph PCAs / UE5 phenotype TMap (face morphs, skin colors, eye material)"),
         ],
     },
     "Weather / Climate": {
@@ -376,8 +388,10 @@ PRESETS = {
         "description": "Settings needed for Varla-HUD to work correctly. "
                        "This is the default configuration.",
         "values": {
+            # Master toggle ON so the dump actually writes
+            "bExportEnabled": 1,
             # Turn ON all Player Character Data except weather
-            "bDumpSaveFormat": 1, "bDumpPlayerCharacter": 1, "bDumpPosition": 1,
+            "bDumpPlayerCharacter": 1, "bDumpPosition": 1,
             "bDumpCharacterInfo": 1, "bDumpFameInfamy": 1, "bDumpGameTime": 1,
             "bDumpGlobalVars": 1, "bDumpMiscStats": 1, "bDumpActiveQuest": 1,
             "bDumpQuestList": 1, "bDumpQuestScriptVars": 1, "bDumpFactions": 1,
@@ -387,6 +401,8 @@ PRESETS = {
             "bDumpSkillProgress": 1, "bDumpQuickKeys": 1, "bDumpStatusEffects": 1,
             "bDumpAVModifiers": 1, "bDumpActiveMagicEffects": 1,
             "bDumpInventoryDetail": 1,
+            "bDumpMapMarkers": 1, "bDumpDialogTopics": 1,
+            "bDumpAppearanceData": 1,
             # Turn OFF everything else (implicit: any key not listed stays 0)
         },
     },
@@ -394,7 +410,7 @@ PRESETS = {
         "description": "Bare minimum for basic character info. "
                        "Fastest dump, smallest file.",
         "values": {
-            "bDumpSaveFormat": 1, "bDumpPlayerCharacter": 1,
+            "bExportEnabled": 1, "bDumpPlayerCharacter": 1,
             "bDumpCharacterInfo": 1, "bDumpAttributes": 1, "bDumpSkills": 1,
             "bDumpInventory": 1, "bDumpSpells": 1, "bDumpQuestList": 1,
         },
@@ -419,7 +435,7 @@ _INI_PATHS = {
     "classic": Path.home() / "Documents" / "My Games" / "Oblivion" / "OBSE" / "varla.ini",
     "remastered": (
         Path(r"E:\SteamLibrary\steamapps\common\Oblivion Remastered")
-        / "OblivionRemastered" / "Binaries" / "Win64" / "OBSE" / "varla.ini"
+        / "OblivionRemastered" / "Binaries" / "Win64" / "OBSE" / "Plugins" / "Varla" / "varla.ini"
     ),
 }
 

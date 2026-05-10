@@ -101,18 +101,29 @@ _ACTIVE_EFF_COLS = [
 ]
 
 _ACTIVE_QUEST_COLS = [
-    _C("name",      "Name",      220),
-    _C("stage",     "Stage",      65, editable=True, numeric=True, min_val=0, max_val=999),
-    _C("editor_id", "EditorID",  160),
-    _C("flags",     "Flags",      80),
-    _C("form_id",   "FormID",    110),
+    _C("name",        "Name",      220),
+    _C("stage",       "Stage",      65, editable=True, numeric=True, min_val=0, max_val=999),
+    _C("__vars__",    "Vars",       80, vars_action=True),
+    _C("editor_id",   "EditorID",  160),
+    _C("flags",       "Flags",      80),
+    _C("form_id",     "FormID",    110),
 ]
 
 _COMPLETED_QUEST_COLS = [
-    _C("name",        "Name",       220),
-    _C("editor_id",   "EditorID",   160),
-    _C("final_stage", "Final Stage", 90),
-    _C("form_id",     "FormID",     110),
+    _C("name",        "Name",        220),
+    _C("__vars__",    "Vars",         80, vars_action=True),
+    _C("editor_id",   "EditorID",    160),
+    _C("final_stage", "Final Stage",  90),
+    _C("form_id",     "FormID",      110),
+]
+
+_QUEST_VARS_COLS = [
+    _C("name",      "Name",      220),
+    _C("__vars__",  "Vars",       80, vars_action=True),
+    _C("status",    "Status",     90),
+    _C("editor_id", "EditorID",  180),
+    _C("script_id", "ScriptID",  110),
+    _C("form_id",   "FormID",    110),
 ]
 
 _GLOBAL_COLS = [
@@ -153,6 +164,7 @@ def get_columns(page_key: str) -> list[ColumnDef]:
     if page_key == "magic_active_effects": return _ACTIVE_EFF_COLS
     if page_key == "active_quests":     return _ACTIVE_QUEST_COLS
     if page_key == "completed_quests":  return _COMPLETED_QUEST_COLS
+    if page_key == "quest_vars":        return _QUEST_VARS_COLS
     if page_key == "globals":           return _GLOBAL_COLS
     if page_key == "game_time":         return _GAME_TIME_COLS
     if page_key == "plugins":           return _PLUGIN_COLS
@@ -175,6 +187,7 @@ def extract_items(page_key: str, data: CharacterData) -> list[PanelItem]:
     if page_key == "magic_active_effects": return _extract_active_effects(data)
     if page_key == "active_quests":     return _extract_active_quests(data)
     if page_key == "completed_quests":  return _extract_completed_quests(data)
+    if page_key == "quest_vars":        return _extract_quest_vars(data)
     if page_key == "globals":           return _extract_globals(data)
     if page_key == "game_time":         return _extract_game_time(data)
     if page_key == "plugins":           return _extract_plugins(data)
@@ -366,6 +379,15 @@ def _extract_active_effects(d: CharacterData) -> list[PanelItem]:
     ]
 
 
+def _vars_count(q) -> str:
+    """Return the count of int+float script vars (refs are read-only)."""
+    sv = getattr(q, "script_vars", None)
+    if not sv:
+        return "0"
+    n = sum(1 for v in sv if v.var_type in ("int", "float"))
+    return str(n)
+
+
 def _extract_active_quests(d: CharacterData) -> list[PanelItem]:
     return [
         PanelItem(
@@ -373,6 +395,7 @@ def _extract_active_quests(d: CharacterData) -> list[PanelItem]:
             values={
                 "name":      q.name or q.editor_id,
                 "stage":     str(q.stage),
+                "__vars__":  _vars_count(q),
                 "editor_id": q.editor_id,
                 "flags":     q.flags,
                 "form_id":   q.form_id,
@@ -383,12 +406,46 @@ def _extract_active_quests(d: CharacterData) -> list[PanelItem]:
     ]
 
 
+def _extract_quest_vars(d: CharacterData) -> list[PanelItem]:
+    """All quests that have a script — independent of started/completed state.
+
+    Source object is a ScriptedQuest; its `script_vars` list is shared with the
+    matching CurrentQuest / CompletedQuest entry (when present), so edits made
+    here are visible from the other panels and to the writer.
+    """
+    started_ids = {q.form_id for q in d.current_quests}
+    completed_ids = {q.form_id for q in d.completed_quests_enriched}
+
+    items: list[PanelItem] = []
+    for sq in d.scripted_quests:
+        if sq.form_id in started_ids:
+            status = "Active"
+        elif sq.form_id in completed_ids:
+            status = "Completed"
+        else:
+            status = "Not Started"
+        items.append(PanelItem(
+            uid=f"sq.{sq.form_id}",
+            values={
+                "name":      sq.name or sq.editor_id,
+                "__vars__":  _vars_count(sq),
+                "status":    status,
+                "editor_id": sq.editor_id,
+                "script_id": sq.script_id,
+                "form_id":   sq.form_id,
+            },
+            source=sq,
+        ))
+    return items
+
+
 def _extract_completed_quests(d: CharacterData) -> list[PanelItem]:
     return [
         PanelItem(
             uid=f"cq.{q.form_id or q.editor_id}",
             values={
                 "name":        q.name or q.editor_id,
+                "__vars__":    _vars_count(q),
                 "editor_id":   q.editor_id,
                 "final_stage": str(q.final_stage),
                 "form_id":     q.form_id,
@@ -482,6 +539,7 @@ class StagedFilter:
     active_quest_ids:  set = field(default_factory=set)   # form_ids
     plugin_indices:    set = field(default_factory=set)
     appearance_fields: set = field(default_factory=set)   # e.g. {"eyes", "hair"}
+    quest_script_var_ids: set = field(default_factory=set)  # form_ids with edited int/float vars
 
     include_char_info:        bool = False
     include_details:          bool = False
@@ -671,6 +729,26 @@ def build_staged_filter(panels: dict, char_data: CharacterData) -> StagedFilter:
         if staged:
             sf.include_completed_quests = True
             char_data.completed_quests_enriched = [pi.source for pi in staged if pi.source]
+
+    # ── quest script vars ────────────────────────────────────────────────
+    # Two ways to get a quest into the QUEST SCRIPT VARIABLES output:
+    #   (1) explicit staging on the quest_vars panel — wins when present
+    #       (so unstaging the row removes the quest from target.txt)
+    #   (2) dirty-var fallback — when no quest_vars row was staged at all,
+    #       any quest with a dialog-edited (is_dirty) var is auto-included
+    #       so dialog edits don't silently disappear.
+    sq_explicit_ids = set()
+    if "quest_vars" in panels:
+        for pi in panels["quest_vars"].get_staged_items():
+            if pi.source and pi.source.form_id:
+                sq_explicit_ids.add(pi.source.form_id)
+
+    if sq_explicit_ids:
+        sf.quest_script_var_ids.update(sq_explicit_ids)
+    else:
+        for fid, vlist in char_data.quest_script_vars.items():
+            if any(v.is_dirty for v in vlist):
+                sf.quest_script_var_ids.add(fid)
 
     # ── globals ───────────────────────────────────────────────────────────
     if "globals" in panels:

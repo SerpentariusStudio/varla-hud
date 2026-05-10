@@ -30,13 +30,27 @@ from save_dump_parser import parse_save_dump
 from save_dump_writer import SaveDumpWriter
 from import_window import ImportWindow
 from import_generator import ImportLogGenerator
+from varla_status import VarlaStatusBar
 import settings as app_settings
 from translations import tr, load_language, set_language, LANGUAGES, current_language
 
-# Default save dump directories per game version
+
+def _page_label(page_key: str) -> str:
+    """Look up the human-friendly label for a sub-page key."""
+    for tab in NAVIGATION_STRUCTURE.values():
+        for page in tab["sub_pages"]:
+            if page["key"] == page_key:
+                return page["label"]
+    return page_key
+
+# Default save dump directories per game version.
+#
+# As of obse64 commit 2041038/a802cc7, the Varla plugin writes save_dump.txt
+# and target.txt to <Documents>\My Games\Oblivion Remastered\OBSE\Plugins\Varla\
+# (was directly under OBSE\). Classic xOBSE still uses the OBSE\ folder.
 _DUMP_DIRS = {
     "classic":    Path.home() / "Documents" / "My Games" / "Oblivion" / "OBSE",
-    "remastered": Path.home() / "Documents" / "My Games" / "Oblivion Remastered" / "OBSE",
+    "remastered": Path.home() / "Documents" / "My Games" / "Oblivion Remastered" / "OBSE" / "Plugins" / "Varla",
 }
 
 
@@ -205,14 +219,15 @@ class VarlaHUD(QMainWindow):
                 cols = get_columns(page_key)
                 panel = DualPanelWidget(columns=cols)
                 panel.clear_target_requested.connect(self._clear_target)
+                panel.staged_changed.connect(self._refresh_target_count)
                 idx = self._stack.addWidget(panel)
                 self._page_map[page_key] = idx
                 self._panels[page_key] = panel
 
-        # Status bar
-        self._status = QStatusBar()
-        self.setStatusBar(self._status)
+        # Status bar — custom Varla pulsing status row at the bottom of the central widget
+        self._status = VarlaStatusBar()
         self._status.showMessage(tr("Open a save dump to begin (File → Open Save Dump)."))
+        root.addWidget(self._status)
 
         # Show first page
         self._nav.initialize()
@@ -220,50 +235,56 @@ class VarlaHUD(QMainWindow):
     def _build_options_bar(self) -> QWidget:
         bar = QFrame()
         bar.setObjectName("options_bar")
-        bar.setFixedHeight(32)
+        bar.setFixedHeight(38)
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(8, 2, 8, 2)
-        layout.setSpacing(6)
+        layout.setContentsMargins(12, 4, 12, 4)
+        layout.setSpacing(8)
 
-        # Default path section
-        path_label = QLabel(tr("Default dump path:"))
+        # ── Dump path block ──────────────────────────────────────────────
+        path_label = QLabel(tr("DUMP PATH"))
         path_label.setObjectName("options_label")
         layout.addWidget(path_label)
 
         self._default_path_lbl = QLabel(self._get_default_path_display())
         self._default_path_lbl.setObjectName("options_path")
-        self._default_path_lbl.setMinimumWidth(200)
+        self._default_path_lbl.setMinimumWidth(220)
+        self._default_path_lbl.setMaximumWidth(440)
+        self._default_path_lbl.setToolTip(self._default_path_lbl.text())
         layout.addWidget(self._default_path_lbl)
 
-        change_btn = QPushButton(tr("Change..."))
+        change_btn = QPushButton(tr("Change…"))
         change_btn.setObjectName("options_btn")
-        change_btn.setFixedWidth(70)
+        change_btn.setCursor(Qt.PointingHandCursor)
         change_btn.clicked.connect(self._change_default_path)
         layout.addWidget(change_btn)
 
         clear_btn = QPushButton(tr("Clear"))
         clear_btn.setObjectName("options_btn")
-        clear_btn.setFixedWidth(50)
+        clear_btn.setCursor(Qt.PointingHandCursor)
         clear_btn.clicked.connect(self._clear_default_path)
         layout.addWidget(clear_btn)
 
-        # Separator
+        # ── Separator ────────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setObjectName("options_sep")
+        sep.setFixedWidth(1)
         layout.addWidget(sep)
 
-        # Import filter toggle
-        filter_lbl = QLabel(tr("Ctrl+S:"))
+        # ── Import-filter toggle ─────────────────────────────────────────
+        filter_lbl = QLabel(tr("Ctrl+S"))
         filter_lbl.setObjectName("options_label")
         layout.addWidget(filter_lbl)
 
         skip = bool(app_settings.get("skip_import_filter"))
-        self._export_toggle_btn = QPushButton(tr("Direct Save") if skip else tr("Import Filter"))
+        self._export_toggle_btn = QPushButton(
+            tr("Direct Save") if skip else tr("Import Filter")
+        )
         self._export_toggle_btn.setObjectName("options_export_btn")
         self._export_toggle_btn.setCheckable(True)
         self._export_toggle_btn.setChecked(skip)
-        self._export_toggle_btn.setFixedWidth(110)
+        self._export_toggle_btn.setFixedWidth(118)
+        self._export_toggle_btn.setCursor(Qt.PointingHandCursor)
         self._export_toggle_btn.setToolTip(
             tr("Import Filter: Ctrl+S opens the Import window to\n"
             "select which staged items to export to target.txt.\n\n"
@@ -274,6 +295,16 @@ class VarlaHUD(QMainWindow):
         layout.addWidget(self._export_toggle_btn)
 
         layout.addStretch()
+
+        # ── Right-aligned primary "Save" action ──────────────────────────
+        self._save_now_btn = QPushButton(tr("Write target.txt"))
+        self._save_now_btn.setObjectName("docPrimaryBtn")
+        self._save_now_btn.setCursor(Qt.PointingHandCursor)
+        self._save_now_btn.setEnabled(False)
+        self._save_now_btn.setToolTip(tr("Write all staged items to target.txt (Ctrl+S)"))
+        self._save_now_btn.clicked.connect(self._open_import_window)
+        layout.addWidget(self._save_now_btn)
+
         return bar
 
     def _dump_path_key(self) -> str:
@@ -352,6 +383,38 @@ class VarlaHUD(QMainWindow):
         idx = self._page_map.get(page_key)
         if idx is not None:
             self._stack.setCurrentIndex(idx)
+            self._status.set_page(tr(_page_label(page_key)))
+            panel = self._panels.get(page_key)
+            if panel is not None:
+                # rough row count = available + staged
+                avail = panel._left_model.rowCount()
+                staged = panel._right_model.rowCount()
+                self._status.set_rows(avail + staged)
+
+    def _set_status_loaded(self, dump_path: Path, detected: str):
+        """Populate the dump segment after a successful load."""
+        try:
+            size_kb = dump_path.stat().st_size / 1024.0
+        except OSError:
+            size_kb = None
+        lines: int | None = None
+        try:
+            with open(dump_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = sum(1 for _ in f)
+        except OSError:
+            pass
+        self._status.set_dump_info(dump_path.name, size_kb=size_kb, lines=lines, active=True)
+        self._status.set_xobse(f"{detected} · ready")
+        self._refresh_target_count()
+
+    def _refresh_target_count(self):
+        if not self._panels:
+            return
+        seen: set = set()
+        for panel in self._panels.values():
+            for pi in panel.get_staged_items():
+                seen.add(pi.uid)
+        self._status.set_target_count(len(seen))
 
     # ── File operations ──────────────────────────────────────────────────
 
@@ -419,8 +482,10 @@ class VarlaHUD(QMainWindow):
 
         self._import_act.setEnabled(True)
         self._save_as_act.setEnabled(True)
+        if hasattr(self, "_save_now_btn"):
+            self._save_now_btn.setEnabled(True)
         detected = char_data.dump_format or "auto"
-        self._status.showMessage(f"Loaded: {path}  [{detected}]")
+        self._set_status_loaded(Path(path), detected)
         self.setWindowTitle(f"Varla-HUD — {Path(path).name}")
 
     def _populate_all_panels(self):

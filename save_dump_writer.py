@@ -31,6 +31,7 @@ class StagedFilter:
     active_quest_ids:  Set[str] = field(default_factory=set)
     plugin_indices:    Set[int] = field(default_factory=set)
     appearance_fields: Set[str] = field(default_factory=set)
+    quest_script_var_ids: Set[str] = field(default_factory=set)  # form_ids of quests with edited int/float vars
 
     include_char_info:        bool = False
     include_details:          bool = False
@@ -139,6 +140,9 @@ class SaveDumpWriter:
         lines = self._patch_factions(lines, sections)
         lines = self._patch_global_variables(lines, sections)
         lines = self._patch_active_magic_effects(lines, sections)
+        lines = self._patch_position(lines, sections)
+        lines = self._patch_completed_quests(lines, sections)
+        lines = self._patch_quest_script_vars(lines, sections)
 
         # Remove lines marked for deletion (e.g. excepted spells) - done here to avoid index drift
         lines = [ln for ln in lines if ln != _DELETED_LINE]
@@ -314,7 +318,9 @@ class SaveDumpWriter:
             kept.update(["COMPLETED QUESTS", "Completed Quests"])
         if sf.include_world_state:
             kept.update(["WEATHER", "CELL INFO", "LOCATION", "MAP MARKERS",
-                         "Weather", "Cell Info", "Location", "Map Markers"])
+                         "POSITION & ROTATION", "WORLD STATE SUMMARY",
+                         "Weather", "Cell Info", "Location", "Map Markers",
+                         "Position & Rotation", "World State Summary"])
         if sf.inventory_ids:
             kept.update(["INVENTORY", "Inventory"])
         if sf.spell_ids:
@@ -330,6 +336,8 @@ class SaveDumpWriter:
         if sf.active_quest_ids:
             kept.update(["ACTIVE QUESTS (Started, Not Completed)", "Active Quests",
                          "ACTIVE QUEST"])
+        if sf.quest_script_var_ids:
+            kept.update(["QUEST SCRIPT VARIABLES", "Quest Script Variables"])
 
         for sec_name, (start, end) in sections.items():
             if sec_name not in kept:
@@ -359,22 +367,35 @@ class SaveDumpWriter:
         # Build lookup by form_id
         item_lookup = {item.form_id: item for item in self.data.items}
 
+        # Tracks whether we're inside an unstaged item's sub-line block.
+        # Each "  [N] Name x Q (FormID) [Type]" line resets the state; the
+        # sub-lines that follow (Weight, Effect, Condition, Soul, Enchantment)
+        # share the same exclusion as their parent header.
+        in_excluded_item = False
+
         for i in range(start + 1, end):
             line = lines[i]
             stripped = line.strip()
             if not stripped:
+                # Blank line ends the per-item context so analytics blocks
+                # below the items list don't get sucked into a delete chain.
+                in_excluded_item = False
                 continue
 
+            matched_header = False
             if self.format == "remastered":
                 m = re.match(
                     r'(\s*\[\d+\]\s+.+?\s+x)-?\d+(\s+\()(0x[0-9A-Fa-f]+)(\)\s*\[\w[\w\s]*\](?:\s*\[EQUIPPED\])?)',
                     line
                 )
                 if m:
+                    matched_header = True
                     form_id = m.group(3)
                     if self._sf and self._sf.inventory_ids and form_id not in self._sf.inventory_ids:
                         lines[i] = _DELETED_LINE
+                        in_excluded_item = True
                         continue
+                    in_excluded_item = False  # entering a kept item
                     item = item_lookup.get(form_id)
                     if item:
                         # Rebuild the line with updated quantity
@@ -400,12 +421,15 @@ class SaveDumpWriter:
                     line
                 )
                 if m:
+                    matched_header = True
                     fid_m = re.search(r'\[([0-9A-Fa-f]+)\]', line)
                     if fid_m:
                         form_id = "0x" + fid_m.group(1).upper()
                         if self._sf and self._sf.inventory_ids and form_id not in self._sf.inventory_ids:
                             lines[i] = _DELETED_LINE
+                            in_excluded_item = True
                             continue
+                        in_excluded_item = False  # entering a kept item
                         item = item_lookup.get(form_id)
                         if item:
                             new_line = f"{m.group(1)}{item.quantity}{m.group(2)}"
@@ -417,6 +441,53 @@ class SaveDumpWriter:
                             if item.enchant_current >= 0 and item.enchant_max >= 0:
                                 new_line += f" Charge:{item.enchant_current:g}/{item.enchant_max:g}"
                             lines[i] = new_line
+
+            # Sub-line of an excluded item: delete it. Sub-lines are indented
+            # further than the main "  [N] ..." entry headers, so any line
+            # that's still indented while we're in the excluded state belongs
+            # to the deleted item. A non-indented line means we left the
+            # items list entirely (analytics, blank, etc.) — drop the flag.
+            if not matched_header and in_excluded_item:
+                if line.startswith("   "):  # 3+ spaces => sub-line of an entry
+                    lines[i] = _DELETED_LINE
+                else:
+                    in_excluded_item = False
+
+        # Second pass: filter analytics subsections like
+        #   "--- Player-Created Potions/Poisons (Mod Index 0xFF) ---"
+        # whose entries don't match the main Items: line format. Each entry
+        # has a 2-space-indent header "  [N] Name xQ (0xFORM)" followed by
+        # detail lines indented 3+ spaces.
+        if self._sf and self._sf.inventory_ids:
+            in_sub = False
+            current_excluded = False
+            for i in range(start + 1, end):
+                line = lines[i]
+                if line == _DELETED_LINE:
+                    continue
+                stripped = line.strip()
+                if stripped.startswith("--- ") and stripped.endswith(" ---"):
+                    in_sub = True
+                    current_excluded = False
+                    continue
+                if not in_sub:
+                    continue
+                # Entry header: 2-space indent + [N] + ... + (0xFORM)
+                hdr_m = re.match(r'^  \[\d+\][^\[]*\((0x[0-9A-Fa-f]+)\)', line)
+                if hdr_m:
+                    form_id = hdr_m.group(1)
+                    current_excluded = form_id not in self._sf.inventory_ids
+                    if current_excluded:
+                        lines[i] = _DELETED_LINE
+                    continue
+                # Detail line under the entry (indent ≥ 3 spaces)
+                if current_excluded and line.startswith("   "):
+                    lines[i] = _DELETED_LINE
+                    continue
+                # Non-indented line (e.g. "Total ..." trailer) ends the subsection
+                if stripped and not line.startswith(" "):
+                    in_sub = False
+                    current_excluded = False
 
         return lines
 
@@ -559,6 +630,16 @@ class SaveDumpWriter:
             "Heavy Armor": "HeavyArmor",
             "Light Armor": "LightArmor",
         }
+
+        # When filtering by skill_names, the trailing "Skill Highlights:" analytics
+        # block (Mastered/Highest/Lowest/Average) references unstaged skills and
+        # would leak their names. Drop everything from that header to end of section.
+        if self._sf and self._sf.skill_names:
+            for i in range(start + 1, end):
+                if lines[i].strip().startswith("Skill Highlights"):
+                    for j in range(i, end):
+                        lines[j] = _DELETED_LINE
+                    break
 
         for i in range(start + 1, end):
             line = lines[i]
@@ -981,6 +1062,184 @@ class SaveDumpWriter:
                         val_m = re.search(r'(=\s*)[\d.\-]+', lines[i])
                         if val_m:
                             lines[i] = lines[i][:val_m.start()] + f"= {gv.value}" + lines[i][val_m.end():]
+
+        return lines
+
+    # ── Completed Quests patching ────────────────────────────────────────
+
+    def _patch_completed_quests(self, lines: List[str], sections: Dict) -> List[str]:
+        """Filter COMPLETED QUESTS entries to those staged by the user."""
+        if not (self._sf and self._sf.include_completed_quests):
+            return lines
+        rng = self._get_section_range(sections, "COMPLETED QUESTS")
+        if not rng:
+            return lines
+
+        staged_form_ids = {
+            getattr(q, "form_id", None) for q in self.data.completed_quests_enriched
+        }
+        staged_form_ids.discard(None)
+        staged_form_ids.discard("")
+        if not staged_form_ids:
+            return lines
+
+        start, end = rng
+        in_excluded = False
+        for i in range(start + 1, end):
+            line = lines[i]
+            stripped = line.strip()
+            # Entry header: "  [N] Name (FORMID) (0xHEX)" or "  [N] Name (0xHEX)"
+            hdr_m = re.match(r'^\s*\[\d+\][^\[]*\((0x[0-9A-Fa-f]+)\)', line)
+            if hdr_m:
+                form_id = hdr_m.group(1)
+                in_excluded = form_id not in staged_form_ids
+                if in_excluded:
+                    lines[i] = _DELETED_LINE
+                continue
+            if in_excluded and (line.startswith("    ") or line.startswith("\t")):
+                lines[i] = _DELETED_LINE
+                continue
+            # Non-indented non-empty line ends the per-entry context
+            if stripped and not line.startswith(" "):
+                in_excluded = False
+
+        return lines
+
+    # ── Quest script variables patching ──────────────────────────────────
+
+    def _patch_quest_script_vars(self, lines: List[str], sections: Dict) -> List[str]:
+        """Patch QUEST SCRIPT VARIABLES section.
+
+        With a staged filter active, only quests in `quest_script_var_ids` keep
+        their block, and within those blocks only edited (`is_dirty`) int/float
+        var lines are kept — everything else in the section is deleted. This
+        keeps target.txt minimal so the importer only re-applies user changes.
+
+        Without a staged filter, every int/float var is rewritten with the
+        current model value (full round-trip).
+        """
+        if not self.data.quest_script_vars:
+            return lines
+
+        rng = self._get_section_range(sections, "QUEST SCRIPT VARIABLES")
+        if not rng:
+            return lines
+
+        sf = self._sf
+        filter_active = bool(sf and sf.quest_script_var_ids)
+        kept_quest_ids = sf.quest_script_var_ids if filter_active else None
+
+        start, end = rng
+        # "Quest: <name> ([editor]) [0xFORMID]"
+        quest_re = re.compile(r'\[(0x[0-9A-Fa-f]+)\]\s*$')
+        # "    name = value (int|float|ref)"
+        var_re = re.compile(r'^(\s+)(\S+)\s*=\s*\S+\s*\((int|float|ref)\)\s*$')
+        # "  Script: 0xFORMID"
+        script_line_re = re.compile(r'^\s+Script:\s*0x[0-9A-Fa-f]+\s*$')
+
+        current_form_id: str = ""
+        current_vars_by_name: Dict[str, "QuestScriptVar"] = {}
+        current_quest_kept = True  # always-kept when no filter
+
+        for i in range(start + 1, end):
+            line = lines[i]
+            stripped = line.strip()
+
+            if stripped.startswith("Quest:"):
+                m = quest_re.search(stripped)
+                current_form_id = m.group(1) if m else ""
+                current_vars_by_name = {}
+                if current_form_id:
+                    var_list = self.data.quest_script_vars.get(current_form_id, [])
+                    current_vars_by_name = {v.name: v for v in var_list}
+                if filter_active:
+                    current_quest_kept = current_form_id in kept_quest_ids
+                    if not current_quest_kept:
+                        lines[i] = _DELETED_LINE
+                continue
+
+            if filter_active and not current_quest_kept:
+                lines[i] = _DELETED_LINE
+                continue
+
+            if not current_form_id or not current_vars_by_name:
+                continue
+
+            m = var_re.match(line)
+            if not m:
+                # Footer / blank lines (e.g. "Total quests with scripts: N").
+                # When filtering, drop them — the counts won't be valid anyway.
+                if filter_active and stripped and not script_line_re.match(line):
+                    lines[i] = _DELETED_LINE
+                continue
+
+            indent, name, var_type = m.group(1), m.group(2), m.group(3)
+            if var_type == "ref":
+                if filter_active:
+                    lines[i] = _DELETED_LINE
+                continue
+
+            var = current_vars_by_name.get(name)
+            if var is None or var.var_type == "ref":
+                if filter_active:
+                    lines[i] = _DELETED_LINE
+                continue
+
+            # When filtering, only keep dirty var lines
+            if filter_active and not var.is_dirty:
+                lines[i] = _DELETED_LINE
+                continue
+
+            if var_type == "int":
+                value_str = str(int(var.value))
+            else:
+                value_str = f"{float(var.value):f}"
+            lines[i] = f"{indent}{name} = {value_str} ({var_type})"
+
+        return lines
+
+    # ── Position & Rotation patching ─────────────────────────────────────
+
+    def _patch_position(self, lines: List[str], sections: Dict) -> List[str]:
+        """Patch Position X/Y/Z, Rotation X/Y/Z, Scale, Parent Cell."""
+        rng = self._get_section_range(sections, "POSITION & ROTATION")
+        if not rng:
+            return lines
+
+        start, end = rng
+        pos = self.data.player_position
+        prefix_map = {
+            "Position X:": pos.x,
+            "Position Y:": pos.y,
+            "Position Z:": pos.z,
+        }
+        for i in range(start + 1, end):
+            stripped = lines[i].strip()
+            for prefix, val in prefix_map.items():
+                if stripped.startswith(prefix):
+                    colon = lines[i].find(":")
+                    lines[i] = f"{lines[i][:colon + 1]} {val:.4f}"
+                    break
+            else:
+                # Rotation lines: "Rotation X: 0.1713 (radians) / 9.82 (degrees)"
+                if stripped.startswith("Rotation X:"):
+                    rad = pos.rot_x
+                    deg = rad * 180.0 / 3.141592653589793
+                    colon = lines[i].find(":")
+                    lines[i] = f"{lines[i][:colon + 1]} {rad:.4f} (radians) / {deg:.2f} (degrees)"
+                elif stripped.startswith("Rotation Y:"):
+                    rad = pos.rot_y
+                    deg = rad * 180.0 / 3.141592653589793
+                    colon = lines[i].find(":")
+                    lines[i] = f"{lines[i][:colon + 1]} {rad:.4f} (radians) / {deg:.2f} (degrees)"
+                elif stripped.startswith("Rotation Z:"):
+                    rad = pos.rot_z
+                    deg = rad * 180.0 / 3.141592653589793
+                    colon = lines[i].find(":")
+                    lines[i] = f"{lines[i][:colon + 1]} {rad:.4f} (radians) / {deg:.2f} (degrees)"
+                elif stripped.startswith("Scale:"):
+                    colon = lines[i].find(":")
+                    lines[i] = f"{lines[i][:colon + 1]} {pos.scale:.4f}"
 
         return lines
 

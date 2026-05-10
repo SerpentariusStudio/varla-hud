@@ -23,16 +23,80 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableView, QListView, QAbstractItemView, QFrame, QLineEdit,
     QSplitter, QStyledItemDelegate, QSizePolicy,
-    QStackedWidget, QSpinBox, QDoubleSpinBox, QStyle,
+    QStackedWidget, QSpinBox, QDoubleSpinBox, QStyle, QDialog,
+    QComboBox,
 )
 from PySide6.QtCore import (
     Qt, Signal, QAbstractTableModel, QModelIndex,
-    QSortFilterProxyModel, QMimeData, QSize,
+    QSortFilterProxyModel, QMimeData, QSize, QRect,
+    QPoint,
 )
-from PySide6.QtGui import QDrag, QPixmap, QIcon, QColor
+from PySide6.QtGui import QDrag, QPixmap, QIcon, QColor, QFont, QPainter, QPen
 
-from theme import COLORS
+from theme import COLORS, BRASS_DEEP, BRASS, INK_OAK, INK_OAK_2, INK_LEATHER, INK_VOID
 from translations import tr
+
+
+# ── Corner-flourish frame ────────────────────────────────────────────────────
+
+class _PanelFrame(QFrame):
+    """
+    A QFrame that paints 4 brass L-bracket flourishes at its corners
+    (replacing the CSS ::before / ::after pseudo-elements from the design).
+    """
+
+    _CORNER = 14   # arm length
+    _INSET  = 4    # gap from frame edge
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.Antialiasing, False)
+            pen = QPen(QColor(BRASS_DEEP))
+            pen.setWidth(1)
+            p.setPen(pen)
+            w = self.width() - 1
+            h = self.height() - 1
+            c = self._CORNER
+            i = self._INSET
+
+            # top-left
+            p.drawLine(i, i, i + c, i)
+            p.drawLine(i, i, i, i + c)
+            # top-right
+            p.drawLine(w - i, i, w - i - c, i)
+            p.drawLine(w - i, i, w - i, i + c)
+            # bottom-left
+            p.drawLine(i, h - i, i + c, h - i)
+            p.drawLine(i, h - i, i, h - i - c)
+            # bottom-right
+            p.drawLine(w - i, h - i, w - i - c, h - i)
+            p.drawLine(w - i, h - i, w - i, h - i - c)
+        finally:
+            p.end()
+
+
+# ── Transfer column with painted central rail ────────────────────────────────
+
+class _XferColumn(QFrame):
+    """Centre transfer column with a faint vertical brass rail in the middle."""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        try:
+            x = self.width() // 2
+            top = 40
+            bot = self.height() - 40
+            if bot > top:
+                pen = QPen(QColor(BRASS_DEEP))
+                pen.setWidth(1)
+                p.setPen(pen)
+                p.setOpacity(0.4)
+                p.drawLine(x, top, x, bot)
+        finally:
+            p.end()
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -55,6 +119,7 @@ class ColumnDef:
     max_val: float = 9999
     decimals: int = 0   # 0 = integer spinbox, >0 = double spinbox
     copy_action: bool = False  # renders "→" button that copies "base" → "current"
+    vars_action: bool = False  # renders "Vars (N)" badge; click opens script-var dialog
 
 
 @dataclass
@@ -223,7 +288,36 @@ class PanelTableModel(QAbstractTableModel):
         self.endResetModel()
 
 
-# ── Delegate (spinbox for numeric editable cells) ─────────────────────────────
+# ── Type-badge palette (per design tokens) ───────────────────────────────────
+# Inventory item types and spell schools rendered as coloured pill badges.
+_TYPE_BADGES = {
+    # Inventory
+    "Weapon":      ("#d88a6a", "#5a2a1a"),
+    "Ammunition":  ("#c48a5a", "#5a3a1a"),
+    "Ammo":        ("#c48a5a", "#5a3a1a"),
+    "Armor":       ("#a0a8c0", "#2a3a5a"),
+    "Armour":      ("#a0a8c0", "#2a3a5a"),
+    "Clothing":    ("#c0a8c0", "#3a2a4a"),
+    "Potion":      ("#a0c8a0", "#2a4a2a"),
+    "Ingredient":  ("#c0c890", "#4a4a1a"),
+    "Apparatus":   ("#a0b8c8", "#2a3a4a"),
+    "Misc":        ("#b8a080", "#3a2a1a"),
+    "Book":        ("#d8b890", "#4a2a1a"),
+    "Key":         ("#e5b564", "#5a4a1a"),
+    "Light":       ("#f0a050", "#5a3a1a"),
+    # Spell schools
+    "Alteration":  ("#a8c8b8", "#2a4a3a"),
+    "Restoration": ("#d8c090", "#5a4a1a"),
+    "Mysticism":   ("#b890d8", "#4a2a5a"),
+    "Destruction": ("#e08866", "#5a2a1a"),
+    "Conjuration": ("#a098c8", "#3a2a5a"),
+    "Illusion":    ("#c8a8c8", "#4a2a4a"),
+}
+
+_BADGE_COLUMNS = {"type", "spell_type", "var_type"}
+
+
+# ── Delegate (spinbox for numeric editable cells + type badges) ──────────────
 
 class SpinDelegate(QStyledItemDelegate):
     def __init__(self, columns: list[ColumnDef], parent=None):
@@ -233,8 +327,8 @@ class SpinDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         if index.column() < len(self._columns):
             col = self._columns[index.column()]
-            if col.copy_action:
-                return None  # no editor for copy button cells
+            if col.copy_action or col.vars_action:
+                return None  # no editor for action button cells
             if col.editable and col.numeric:
                 if col.decimals > 0:
                     sb = QDoubleSpinBox(parent)
@@ -247,18 +341,84 @@ class SpinDelegate(QStyledItemDelegate):
         return super().createEditor(parent, option, index)
 
     def paint(self, painter, option, index):
-        if index.column() < len(self._columns) and self._columns[index.column()].copy_action:
+        if index.column() >= len(self._columns):
+            super().paint(painter, option, index)
+            return
+
+        col = self._columns[index.column()]
+
+        # ── copy-action arrow cell ───────────────────────────────────────
+        if col.copy_action:
             self.initStyleOption(option, index)
             painter.save()
             if option.state & QStyle.State_Selected:
                 painter.fillRect(option.rect, option.palette.highlight())
-            painter.setPen(QColor(COLORS.get("accent", "#c8a84b")))
+            painter.setPen(QColor(COLORS.get("brass_lit", "#c79443")))
             f = painter.font()
             f.setBold(True)
             painter.setFont(f)
             painter.drawText(option.rect, Qt.AlignCenter, "→")
             painter.restore()
             return
+
+        # ── vars-action button cell (script vars dialog launcher) ────────
+        if col.vars_action:
+            self.initStyleOption(option, index)
+            painter.save()
+            if option.state & QStyle.State_Selected:
+                painter.fillRect(option.rect, option.palette.highlight())
+            text = str(index.data(Qt.DisplayRole) or "").strip()
+            # Faded look when no vars (count == 0 or blank)
+            has_vars = bool(text and text not in ("0", "—"))
+            fg = QColor(COLORS.get("brass_lit", "#c79443") if has_vars
+                        else COLORS.get("text_muted", "#7a6a4a"))
+            border = QColor("#3a2912")
+            m = 4
+            pill_h = min(option.rect.height() - 2 * m, 18)
+            pill_y = option.rect.y() + (option.rect.height() - pill_h) // 2
+            pill_w = max(0, option.rect.width() - 2 * m)
+            pill_rect = QRect(option.rect.x() + m, pill_y, pill_w, pill_h)
+            painter.setPen(border)
+            painter.setBrush(QColor("#0b0804"))
+            painter.drawRoundedRect(pill_rect, 2, 2)
+            painter.setPen(fg)
+            label = f"Vars ({text or '0'})" if has_vars else "—"
+            painter.drawText(pill_rect, Qt.AlignCenter, label)
+            painter.restore()
+            return
+
+        # ── type-badge pill (Type / Spell Type / Var Type) ───────────────
+        if col.key in _BADGE_COLUMNS:
+            text = str(index.data(Qt.DisplayRole) or "").strip()
+            if text:
+                # Match the canonical badge keys case-insensitively
+                key = next((k for k in _TYPE_BADGES if k.lower() == text.lower()), None)
+                fg, border = _TYPE_BADGES.get(key, ("#b89a6a", "#3a2912"))
+                painter.save()
+                # selection / hover bg from default
+                if option.state & QStyle.State_Selected:
+                    painter.fillRect(option.rect, option.palette.highlight())
+                # Draw the pill
+                m = 4
+                pill_h = min(option.rect.height() - 2 * m, 18)
+                pill_y = option.rect.y() + (option.rect.height() - pill_h) // 2
+                # Width: text + horizontal padding
+                f = painter.font()
+                f.setPointSize(max(8, f.pointSize() - 1))
+                f.setCapitalization(QFont.Capitalization.AllUppercase)
+                painter.setFont(f)
+                fm = painter.fontMetrics()
+                tw = fm.horizontalAdvance(text.upper()) + 14
+                pill_w = min(tw, option.rect.width() - 2 * m)
+                pill_rect = QRect(option.rect.x() + m, pill_y, pill_w, pill_h)
+                painter.setPen(QColor(border))
+                painter.setBrush(QColor("#0b0804"))
+                painter.drawRoundedRect(pill_rect, 2, 2)
+                painter.setPen(QColor(fg))
+                painter.drawText(pill_rect, Qt.AlignCenter, text.upper())
+                painter.restore()
+                return
+
         super().paint(painter, option, index)
 
     def setEditorData(self, editor, index):
@@ -278,6 +438,125 @@ class SpinDelegate(QStyledItemDelegate):
             model.setData(index, editor.value(), Qt.EditRole)
         else:
             super().setModelData(editor, model, index)
+
+
+# ── Paint mode (toolbar-button trigger → drag-paint a value onto rows) ──────
+
+class _PaintValuePopup(QFrame):
+    """Toolbar-button popup for arming paint mode.
+
+    Lets the user pick which editable numeric column to paint, and the value
+    to apply. After Confirm, paint mode is armed: the next click+drag on the
+    staged view paints `value` onto every row hovered, then auto-disarms.
+    """
+    confirmed = Signal(int, float)  # column index, value
+
+    def __init__(self, columns: list, parent=None):
+        super().__init__(parent, Qt.Popup)
+        self.setObjectName("paintPopup")
+        self.setStyleSheet(
+            "QFrame#paintPopup {"
+            f"  background-color: {INK_VOID};"
+            "   border: 1px solid #6a4f1c;"
+            "   border-radius: 2px;"
+            "}"
+            "QFrame#paintPopup QLabel {"
+            "   background: transparent;"
+            f"  color: {COLORS.get('brass_lit', '#c79443')};"
+            "   font-size: 10pt;"
+            "}"
+        )
+        # Restrict to columns that are actually paintable
+        self._paintable = [(i, c) for i, c in enumerate(columns) if c.editable and c.numeric]
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        title = QLabel(tr("Paint value onto rows"))
+        f = title.font(); f.setBold(True); title.setFont(f)
+        layout.addWidget(title)
+
+        col_row = QHBoxLayout()
+        col_row.setSpacing(8)
+        col_row.addWidget(QLabel(tr("Column:")))
+        self._col_combo = QComboBox()
+        for col_idx, col_def in self._paintable:
+            self._col_combo.addItem(col_def.label, col_idx)
+        col_row.addWidget(self._col_combo, 1)
+        layout.addLayout(col_row)
+
+        val_row = QHBoxLayout()
+        val_row.setSpacing(8)
+        val_row.addWidget(QLabel(tr("Value:")))
+        # Both spinboxes are kept and swapped via QStackedWidget when the
+        # column type changes (int vs float).
+        self._val_stack = QStackedWidget()
+        self._spin_int = QSpinBox()
+        self._spin_float = QDoubleSpinBox()
+        self._val_stack.addWidget(self._spin_int)
+        self._val_stack.addWidget(self._spin_float)
+        val_row.addWidget(self._val_stack, 1)
+        layout.addLayout(val_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton(tr("Cancel"))
+        cancel_btn.setFixedHeight(24)
+        cancel_btn.clicked.connect(self.close)
+        btn_row.addWidget(cancel_btn)
+        confirm_btn = QPushButton(tr("Confirm"))
+        confirm_btn.setFixedHeight(24)
+        confirm_btn.setDefault(True)
+        confirm_btn.clicked.connect(self._on_confirm)
+        btn_row.addWidget(confirm_btn)
+        layout.addLayout(btn_row)
+
+        self._col_combo.currentIndexChanged.connect(self._sync_spinbox)
+        self._sync_spinbox()
+
+    def _current(self) -> tuple:
+        idx = self._col_combo.currentIndex()
+        if idx < 0 or idx >= len(self._paintable):
+            return (-1, None)
+        return self._paintable[idx]
+
+    def _sync_spinbox(self):
+        col_idx, col_def = self._current()
+        if col_def is None:
+            return
+        if col_def.decimals > 0:
+            self._spin_float.setDecimals(col_def.decimals)
+            self._spin_float.setRange(col_def.min_val, col_def.max_val)
+            self._val_stack.setCurrentWidget(self._spin_float)
+            self._spin_float.setFocus()
+            self._spin_float.selectAll()
+        else:
+            self._spin_int.setRange(int(col_def.min_val), int(col_def.max_val))
+            self._val_stack.setCurrentWidget(self._spin_int)
+            self._spin_int.setFocus()
+            self._spin_int.selectAll()
+
+    def _on_confirm(self):
+        col_idx, col_def = self._current()
+        if col_def is None:
+            self.close()
+            return
+        if col_def.decimals > 0:
+            value = float(self._spin_float.value())
+        else:
+            value = float(self._spin_int.value())
+        self.confirmed.emit(col_idx, value)
+        self.close()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._on_confirm()
+            return
+        if event.key() == Qt.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -306,6 +585,7 @@ class PanelView(QTableView):
     """Table view with drag-drop and double-click-to-move."""
     move_requested = Signal(list)   # [uid, ...] — fired from source (double-click)
     drop_received  = Signal(list)   # [uid, ...] — fired on destination (drop)
+    vars_action_requested = Signal(object)  # PanelItem — fired when a vars-action cell is clicked
 
     def __init__(self, panel_id: str, parent=None):
         super().__init__(parent)
@@ -328,8 +608,54 @@ class PanelView(QTableView):
         self.setEditTriggers(
             QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed
         )
+        # Paint-mode state (only meaningful on the editable/staged view)
+        self._paint_armed: bool = False
+        self._paint_col: int = -1
+        self._paint_value: float = 0.0
+        self._paint_painted_uids: set = set()
+
+    # ── Paint mode ────────────────────────────────────────────────────────
+
+    def arm_paint(self, column: int, value: float):
+        """Enter paint mode. Next press+drag paints `value` into `column`
+        on every row hovered, then auto-disarms on release."""
+        self._paint_armed = True
+        self._paint_col = column
+        self._paint_value = value
+        self._paint_painted_uids.clear()
+        self.viewport().setCursor(Qt.CrossCursor)
+
+    def _disarm_paint(self):
+        self._paint_armed = False
+        self._paint_col = -1
+        self._paint_painted_uids.clear()
+        self.viewport().unsetCursor()
+
+    def _paint_at(self, viewport_pos):
+        idx = self.indexAt(viewport_pos)
+        if not idx.isValid():
+            return
+        proxy = self.model()
+        src_model = proxy.sourceModel() if isinstance(proxy, QSortFilterProxyModel) else proxy
+        src_idx = proxy.mapToSource(idx) if isinstance(proxy, QSortFilterProxyModel) else idx
+        row = src_idx.row()
+        if row < 0 or row >= len(src_model._items):
+            return
+        uid = src_model._items[row].uid
+        if uid in self._paint_painted_uids:
+            return  # already painted in this drag pass
+        self._paint_painted_uids.add(uid)
+        if 0 <= self._paint_col < src_model.columnCount():
+            target = src_model.index(row, self._paint_col)
+            src_model.setData(target, self._paint_value, Qt.EditRole)
 
     def mousePressEvent(self, event):
+        # Paint mode wins over every other left-click handler so the press
+        # doesn't also start a selection / drag.
+        if self._paint_armed and event.button() == Qt.LeftButton:
+            self._paint_at(event.pos())
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
             idx = self.indexAt(event.pos())
             if idx.isValid():
@@ -341,7 +667,26 @@ class PanelView(QTableView):
                     if col.copy_action and src_model._editable_panel:
                         self._copy_base_to_current(src_model, src_idx.row())
                         return
+                    if col.vars_action:
+                        row = src_idx.row()
+                        if 0 <= row < len(src_model._items):
+                            self.vars_action_requested.emit(src_model._items[row])
+                        return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._paint_armed and (event.buttons() & Qt.LeftButton):
+            self._paint_at(event.pos())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._paint_armed and event.button() == Qt.LeftButton:
+            self._disarm_paint()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def _copy_base_to_current(self, src_model, row):
         cols = src_model._columns
@@ -495,42 +840,83 @@ class DualPanelWidget(QWidget):
 
     def _build_panel(self, panel_id: str, title: str,
                      model: PanelTableModel, proxy: MultiColumnFilter):
-        frame = QFrame()
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        # The panel itself is a corner-flourished frame
+        is_staged = (panel_id == "right")
+        kind = "staged" if is_staged else "available"
 
-        # Header row
-        header = QHBoxLayout()
-        title_lbl = QLabel(title)
+        frame = _PanelFrame()
+        frame.setObjectName("varlaPanel")
+        frame.setProperty("panelKind", kind)
+        layout = QVBoxLayout(frame)
+        # leave a 10px outer margin so the corner brackets are visible
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(0)
+
+        # ── Header bar ────────────────────────────────────────────────────
+        header_bar = QFrame()
+        header_bar.setObjectName("varlaPanelHeader")
+        header_bar.setProperty("panelKind", kind)
+        header_bar.setMinimumHeight(34)
+
+        header = QHBoxLayout(header_bar)
+        header.setContentsMargins(14, 6, 14, 6)
+        header.setSpacing(10)
+
+        title_lbl = QLabel(title.upper())
         title_lbl.setObjectName("panelHeader")
+        title_lbl.setProperty("panelKind", kind)
         header.addWidget(title_lbl)
         header.addStretch()
 
         counter = QLabel("0 items")
         counter.setObjectName("counterLabel")
+        counter.setProperty("panelKind", kind)
         header.addWidget(counter)
+
+        # Paint button (staged panel only). Only shown when the page actually
+        # has at least one editable numeric column to paint into.
+        if is_staged and any(c.editable and c.numeric for c in self._columns):
+            paint_btn = QPushButton("🖌")
+            paint_btn.setObjectName("viewToggleBtn")
+            paint_btn.setFixedSize(24, 22)
+            paint_btn.setCursor(Qt.PointingHandCursor)
+            paint_btn.setToolTip(tr(
+                "Paint a value onto rows. After Confirm, click and drag over "
+                "rows to apply the value; release to disarm."
+            ))
+            paint_btn.clicked.connect(
+                lambda _checked, b=paint_btn: self._open_paint_popup(b)
+            )
+            header.addWidget(paint_btn)
 
         list_btn = QPushButton("≡")
         grid_btn = QPushButton("⊞")
         for btn in [list_btn, grid_btn]:
-            btn.setFixedSize(26, 26)
+            btn.setFixedSize(24, 22)
             btn.setObjectName("viewToggleBtn")
             btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
         list_btn.setChecked(True)
         header.addWidget(list_btn)
         header.addWidget(grid_btn)
-        layout.addLayout(header)
+        layout.addWidget(header_bar)
 
-        # Search bar
+        # ── Search row ────────────────────────────────────────────────────
+        search_row = QFrame()
+        search_row.setObjectName("varlaSearchRow")
+        sr_layout = QHBoxLayout(search_row)
+        sr_layout.setContentsMargins(12, 8, 12, 8)
+        sr_layout.setSpacing(8)
+
         search = QLineEdit()
         search.setPlaceholderText(tr("Search..."))
         search.setObjectName("searchBar")
         search.setClearButtonEnabled(True)
         search.textChanged.connect(proxy.setFilterFixedString)
-        layout.addWidget(search)
+        sr_layout.addWidget(search, 1)
+        layout.addWidget(search_row)
 
-        # View stack
+        # ── View stack ────────────────────────────────────────────────────
         stack = QStackedWidget()
 
         list_view = PanelView(panel_id)
@@ -573,11 +959,18 @@ class DualPanelWidget(QWidget):
         list_view.drop_received.connect(on_drop)
         grid_view.move_requested.connect(on_move)
         grid_view.drop_received.connect(on_drop)
+        # Vars-action: forward to a panel-level dispatcher so the parent panel
+        # can refresh the row count after the dialog closes.
+        list_view.vars_action_requested.connect(
+            lambda pi, m=model: self._open_vars_dialog(pi, m))
 
         # Counter update
         def update_counter():
             n = model.rowCount()
-            counter.setText(f"{n} item{'s' if n != 1 else ''}")
+            if is_staged:
+                counter.setText(f"{n}")
+            else:
+                counter.setText(f"{n} item{'s' if n != 1 else ''}")
 
         model.rowsInserted.connect(lambda *_: update_counter())
         model.rowsRemoved.connect(lambda *_: update_counter())
@@ -586,30 +979,107 @@ class DualPanelWidget(QWidget):
         return frame, list_view, grid_view, stack
 
     def _build_center_buttons(self) -> QFrame:
-        frame = QFrame()
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(4, 0, 4, 0)
-        layout.setAlignment(Qt.AlignCenter)
-        frame.setFixedWidth(90)
-        for label, slot in [
-            (tr("All →"),  self._move_all_to_right),
-            (tr("Sel →"),  self._move_selected_to_right),
-            (tr("← Sel"),  self._move_selected_to_left),
-            (tr("← All"),  self._move_all_to_left),
-        ]:
-            btn = QPushButton(label)
-            btn.setObjectName("transferBtn")
-            btn.setFixedWidth(80)
-            btn.clicked.connect(slot)
-            layout.addWidget(btn)
+        frame = _XferColumn()
+        frame.setObjectName("xferColumn")
+        frame.setFixedWidth(86)
 
-        layout.addSpacing(8)
-        clear_btn = QPushButton(tr("Clear Target"))
-        clear_btn.setObjectName("transferBtn")
-        clear_btn.setFixedWidth(80)
-        clear_btn.clicked.connect(self.clear_target_requested.emit)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(8, 12, 8, 12)
+        layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignCenter)
+
+        def _make_xfer(label: str, object_name: str, slot) -> QPushButton:
+            b = QPushButton(label)
+            b.setObjectName(object_name)
+            b.setFixedWidth(64)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(slot)
+            return b
+
+        # Group 1 — SEND RIGHT (All / Sel)
+        lbl_right = QLabel(tr("SEND RIGHT"))
+        lbl_right.setObjectName("xferGroupLabel")
+        layout.addWidget(lbl_right)
+        layout.addWidget(_make_xfer("⟫  All", "xferBtnStrong", self._move_all_to_right))
+        layout.addWidget(_make_xfer("⟩  Sel", "xferBtn",       self._move_selected_to_right))
+
+        layout.addSpacing(14)
+
+        # Group 2 — SEND LEFT (Sel / All)
+        lbl_left = QLabel(tr("SEND LEFT"))
+        lbl_left.setObjectName("xferGroupLabel")
+        layout.addWidget(lbl_left)
+        layout.addWidget(_make_xfer("⟨  Sel", "xferBtn",       self._move_selected_to_left))
+        layout.addWidget(_make_xfer("⟪  All", "xferBtnStrong", self._move_all_to_left))
+
+        layout.addSpacing(14)
+
+        # Group 3 — CLEAR (destructive)
+        lbl_clear = QLabel(tr("CLEAR"))
+        lbl_clear.setObjectName("xferGroupLabel")
+        layout.addWidget(lbl_clear)
+        clear_btn = _make_xfer(tr("Clear"), "xferBtnDanger", self.clear_target_requested.emit)
         layout.addWidget(clear_btn)
+
+        layout.addStretch()
         return frame
+
+    # ── Paint mode wiring ─────────────────────────────────────────────────
+
+    def _open_paint_popup(self, anchor_widget: QWidget):
+        """Show the paint popup anchored under `anchor_widget` (the toolbar
+        button). Confirm arms paint mode on the staged view."""
+        # Skip pages that have nothing paintable (no editable numeric cols)
+        if not any(c.editable and c.numeric for c in self._columns):
+            return
+        popup = _PaintValuePopup(self._columns, parent=self)
+        popup.confirmed.connect(
+            lambda col, val: self._right_list.arm_paint(col, val)
+        )
+        popup.adjustSize()
+        # Right-align the popup with the button so it doesn't overflow off-screen
+        anchor = anchor_widget.mapToGlobal(QPoint(
+            anchor_widget.width() - popup.width(),
+            anchor_widget.height() + 2,
+        ))
+        popup.move(anchor)
+        popup.show()
+
+    # ── Quest script vars dialog ──────────────────────────────────────────
+
+    def _open_vars_dialog(self, panel_item, model: PanelTableModel):
+        """Open the QuestScriptVarDialog for the row's source quest.
+
+        Mutates the quest's script_vars list in place; updates the row's
+        displayed count if any value changes.
+        """
+        # Local import keeps dual_panel decoupled from the dialog module.
+        from quest_vars_dialog import QuestScriptVarDialog
+
+        source = panel_item.source
+        script_vars = getattr(source, "script_vars", None)
+        if script_vars is None:
+            return
+
+        quest_label = (
+            getattr(source, "name", "") or
+            getattr(source, "editor_id", "") or
+            getattr(source, "form_id", "(quest)")
+        )
+
+        dlg = QuestScriptVarDialog(script_vars, quest_label, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.was_modified:
+            # Re-render the row's "Vars" cell so the count reflects edits if any
+            # vars were added/removed (currently we only edit values, but keep
+            # this future-proof).
+            for row, it in enumerate(model._items):
+                if it.uid == panel_item.uid:
+                    model.dataChanged.emit(
+                        model.index(row, 0),
+                        model.index(row, model.columnCount() - 1),
+                    )
+                    break
+            self.staged_changed.emit()
 
     # ── Transfer operations ───────────────────────────────────────────────
 

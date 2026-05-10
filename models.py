@@ -81,6 +81,9 @@ class CurrentQuest:
     name: str = ""
     form_id: str = ""
     flags: str = ""
+    # Same list-object as CharacterData.quest_script_vars[form_id], so edits
+    # made through the quest's row in the UI are visible to the writer.
+    script_vars: List["QuestScriptVar"] = field(default_factory=list)
 
 
 @dataclass
@@ -90,6 +93,47 @@ class CompletedQuest:
     name: str = ""
     form_id: str = ""
     final_stage: int = 0
+    script_vars: List["QuestScriptVar"] = field(default_factory=list)
+
+
+@dataclass
+class QuestScriptVar:
+    """A single script variable attached to a quest.
+
+    Mirrors the QUEST SCRIPT VARIABLES dump section. The plugin importsave
+    only re-applies vars where var_type is 'int' or 'float'; 'ref' vars are
+    parsed for display but not editable in the GUI.
+    """
+    quest_form_id: str
+    name: str
+    value: float = 0.0
+    var_type: str = "float"  # "int" | "float" | "ref"
+    raw_value: str = ""      # original text (e.g. "0x000224D8" for refs)
+    original_value: float = 0.0  # value at parse time — used to detect edits
+
+    @property
+    def is_dirty(self) -> bool:
+        """True if the user changed `value` from its parsed-from-dump value."""
+        if self.var_type == "ref":
+            return False
+        return self.value != self.original_value
+
+
+@dataclass
+class ScriptedQuest:
+    """A quest that has a script — sourced from the QUEST SCRIPT VARIABLES
+    dump section. Includes quests that aren't started or completed yet, so
+    the user can edit their vars before triggering the quest in-game.
+
+    `script_vars` is the same list-object as
+    CharacterData.quest_script_vars[form_id] and any matching CurrentQuest /
+    CompletedQuest, so edits propagate without re-syncing.
+    """
+    form_id: str
+    name: str = ""
+    editor_id: str = ""
+    script_id: str = ""
+    script_vars: List["QuestScriptVar"] = field(default_factory=list)
 
 
 @dataclass
@@ -392,6 +436,10 @@ class CharacterData:
     completed_quests_enriched: List[CompletedQuest] = field(default_factory=list)
     active_quest: Optional[ActiveQuest] = None
     current_quests: List[CurrentQuest] = field(default_factory=list)
+    # Quest script variables, keyed by quest form_id (e.g. "0x000224D8") in dump-order
+    quest_script_vars: Dict[str, List[QuestScriptVar]] = field(default_factory=dict)
+    # Every quest with a script (started, completed, or not yet started)
+    scripted_quests: List[ScriptedQuest] = field(default_factory=list)
     items: List[InventoryItem] = field(default_factory=list)
     spells: List[Spell] = field(default_factory=list)
     spells_to_remove: List[Spell] = field(default_factory=list)

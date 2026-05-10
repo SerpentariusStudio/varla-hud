@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from models import (
     CharacterData, CharacterInfo, Spell, SpellEffect, InventoryItem,
-    Faction, ActiveQuest, CurrentQuest, CompletedQuest,
+    Faction, ActiveQuest, CurrentQuest, CompletedQuest, QuestScriptVar,
+    ScriptedQuest,
     PCMISCSTAT_NAMES, ATTRIBUTE_NAMES, SKILL_NAMES,
     Vitals, MagicResistances, MagicEffects, GlobalVariable,
     GameTime, ActiveMagicEffect, PlayerPosition, WeatherInfo,
@@ -167,6 +168,13 @@ class SaveDumpParser:
         data.active_quest = self._parse_active_quest()
         data.current_quests = self._parse_active_quests_list()
         data.completed_quests, data.completed_quests_enriched = self._parse_completed_quests()
+        data.quest_script_vars, data.scripted_quests = self._parse_quest_script_vars()
+        # Bind each quest's script_vars to the dict's list so UI edits and
+        # writer round-trip see the same list object.
+        for q in data.current_quests:
+            q.script_vars = data.quest_script_vars.setdefault(q.form_id, [])
+        for q in data.completed_quests_enriched:
+            q.script_vars = data.quest_script_vars.setdefault(q.form_id, [])
         data.factions = self._parse_factions()
         data.attributes = self._parse_attributes()
         data.vitals = self._parse_derived_stats()
@@ -264,6 +272,23 @@ class SaveDumpParser:
             elif line.startswith("Birthsign:"):
                 raw = line.split(":", 1)[1].strip()
                 info.birthsign = raw.split("(")[0].strip()
+            elif line.startswith("Gender:"):
+                # Classic dumps: "Gender: Male" / "Gender: Female"
+                raw = line.split(":", 1)[1].strip()
+                if raw in ("Male", "Female"):
+                    info.sex = raw
+
+        # Remastered dumps put the (numeric) gender flag in APPEARANCE instead.
+        if not info.sex:
+            for line in self._get_section_lines("APPEARANCE"):
+                line = line.strip()
+                if line.startswith("Gender:"):
+                    raw = line.split(":", 1)[1].strip().split()[0]
+                    if raw == "0":
+                        info.sex = "Male"
+                    elif raw == "1":
+                        info.sex = "Female"
+                    break
 
         return info
 
@@ -602,6 +627,90 @@ class SaveDumpParser:
 
         return simple_list, enriched_list
 
+    def _parse_quest_script_vars(self) -> Tuple[Dict[str, List[QuestScriptVar]], List[ScriptedQuest]]:
+        """Parse the QUEST SCRIPT VARIABLES section.
+
+        Format (one block per quest):
+            Quest: <Name> (<EditorID>) [0xFORMID]
+              Script: 0xSCRIPTID
+                <name> = <value> (int)
+                <name> = <value> (float)
+                <name> = 0xFORMID (ref)
+
+        Returns (vars_by_form_id, scripted_quests). The script_vars list is
+        the same object in both — edits to one show up in the other.
+        """
+        result: Dict[str, List[QuestScriptVar]] = {}
+        scripted: List[ScriptedQuest] = []
+        section_lines = self._get_section_lines("QUEST SCRIPT VARIABLES")
+        if not section_lines:
+            return result, scripted
+
+        # Quest header line: "Quest: <Name> (<editor>) [0xFORMID]"
+        # Preserve the dump's casing — active_quests parser does the same so
+        # lookups by form_id stay consistent across sections.
+        quest_header_re = re.compile(
+            r'^Quest:\s*(?P<name>.*?)\s*\((?P<editor>[^()]+)\)\s*\[(?P<fid>0x[0-9A-Fa-f]+)\]\s*$'
+        )
+        script_re = re.compile(r'^\s*Script:\s*(0x[0-9A-Fa-f]+)\s*$')
+        # Var line: "    name = value (int|float|ref)"
+        var_re = re.compile(r'^\s+(\S+)\s*=\s*(\S+)\s*\((int|float|ref)\)\s*$')
+
+        current: ScriptedQuest | None = None
+        for raw in section_lines:
+            stripped = raw.strip()
+            mh = quest_header_re.match(stripped)
+            if mh:
+                fid = mh.group("fid")
+                # Same list-object in dict and ScriptedQuest so the writer
+                # and UI see edits regardless of which collection they walk.
+                vars_list = result.setdefault(fid, [])
+                current = ScriptedQuest(
+                    form_id=fid,
+                    name=mh.group("name").strip(),
+                    editor_id=mh.group("editor").strip(),
+                    script_vars=vars_list,
+                )
+                scripted.append(current)
+                continue
+
+            if current is None:
+                continue
+
+            ms = script_re.match(raw)
+            if ms:
+                current.script_id = ms.group(1)
+                continue
+
+            mv = var_re.match(raw)
+            if not mv:
+                continue
+
+            name, raw_value, var_type = mv.group(1), mv.group(2), mv.group(3)
+            value = 0.0
+            if var_type == "ref":
+                # Ref values are formIDs in hex; keep numeric value 0 for editor
+                # purposes — refs are not imported and not editable.
+                pass
+            else:
+                try:
+                    value = float(raw_value)
+                except ValueError:
+                    continue
+
+            current.script_vars.append(
+                QuestScriptVar(
+                    quest_form_id=current.form_id,
+                    name=name,
+                    value=value,
+                    var_type=var_type,
+                    raw_value=raw_value,
+                    original_value=value,
+                )
+            )
+
+        return result, scripted
+
     def _parse_factions(self) -> List[Faction]:
         """Parse FACTIONS section."""
         factions = []
@@ -859,9 +968,10 @@ class SaveDumpParser:
                 continue
 
             # Base game effect line:
-            # "Restore Health (LOC_FN_REHE) [REHE] (Self) Mag: 8 [Health]"
+            # Remastered: "Restore Health (LOC_FN_REHE) [REHE] (Self) Mag: 8 [Health]"
+            # Classic:    "Restore Health [REHE] (Self) Mag: 8 Dur: 0s"
             base_effect = re.match(
-                r'(.+?)\s+\([^)]*\)\s+\[(\w+)\]\s+\((\w+)\)\s*(.*?)(?:\[.*\])?$',
+                r'(.+?)\s+(?:\([^)]*\)\s+)?\[(\w+)\]\s+\((\w+)\)\s*(.*?)(?:\[.*\])?$',
                 stripped
             )
             if base_effect:
@@ -919,45 +1029,78 @@ class SaveDumpParser:
     def _parse_inventory(self) -> List[InventoryItem]:
         """Parse INVENTORY section."""
         items = []
+        # Use the un-stripped lines so we can detect the header/detail indent boundary.
+        section_lines = self._get_section_lines("INVENTORY")
 
-        for line in self._get_section_lines("INVENTORY"):
-            line = line.strip()
-            if not line or line.startswith("Total Weight:") or line.startswith("Armor Weight:") or line.startswith("Items:") or line.startswith("Total unique"):
+        current_item: InventoryItem | None = None
+        for raw in section_lines:
+            line = raw.rstrip("\n")
+            stripped = line.strip()
+
+            # Skip headers / blanks / once-we-leave-the-Items-block trailers
+            if not stripped or stripped.startswith("Total Weight:") \
+                    or stripped.startswith("Armor Weight:") \
+                    or stripped.startswith("Items:") \
+                    or stripped.startswith("Total unique") \
+                    or stripped.startswith("Carry Capacity") \
+                    or stripped.startswith("Estimated") \
+                    or stripped.startswith("Breakdown:") \
+                    or stripped.startswith("---"):
+                # A '---' subsection header ends the main item context (the
+                # Player-Created subsection has its own format we don't model).
+                if stripped.startswith("---"):
+                    current_item = None
                 continue
 
-            # Format: "[0] LOC_FN_ScrollStandardSummonClannfearExpert x1 (0x00015AD9) [Book]"
-            # Or:     "[31] LOC_FN_DremoraClaymoreEnchAbsorbMagicka x1 (0x000149EF) [Weapon] [EQUIPPED]"
-            # Extended: "[0] Iron Sword x1 (0x00012EB7) [Weapon] HP:80/100 Charge:50/200"
+            # Item header: "[N] Name xQ (0xFORM) [Type] [EQUIPPED]?  optional HP:.. Charge:.."
             m = re.match(
                 r'\[\d+\]\s+(.+?)\s+x(-?\d+)\s+\((0x[0-9A-Fa-f]+)\)\s*\[(\w[\w\s]*)\](?:\s*\[EQUIPPED\])?',
-                line
+                stripped,
             )
             if m:
-                item_name = m.group(1)
-                quantity = int(m.group(2))
-                form_id = m.group(3)
-                item_type = m.group(4).strip()
-                equipped = "[EQUIPPED]" in line
-
-                item = InventoryItem(
-                    form_id=form_id,
-                    name=item_name,
-                    quantity=quantity,
-                    item_type=item_type,
-                    equipped=equipped
+                current_item = InventoryItem(
+                    form_id=m.group(3),
+                    name=m.group(1),
+                    quantity=int(m.group(2)),
+                    item_type=m.group(4).strip(),
+                    equipped="[EQUIPPED]" in stripped,
                 )
-
-                # Parse optional HP: and Charge: suffixes
-                hp_match = re.search(r'HP:([\d.]+)/([\d.]+)', line)
-                charge_match = re.search(r'Charge:([\d.]+)/([\d.]+)', line)
+                # Same-line HP: / Charge: suffixes (older dump format)
+                hp_match = re.search(r'HP:([\d.]+)/([\d.]+)', stripped)
+                charge_match = re.search(r'Charge:([\d.]+)/([\d.]+)', stripped)
                 if hp_match:
-                    item.condition_current = float(hp_match.group(1))
-                    item.condition_max = float(hp_match.group(2))
+                    current_item.condition_current = float(hp_match.group(1))
+                    current_item.condition_max = float(hp_match.group(2))
                 if charge_match:
-                    item.enchant_current = float(charge_match.group(1))
-                    item.enchant_max = float(charge_match.group(2))
+                    current_item.enchant_current = float(charge_match.group(1))
+                    current_item.enchant_max = float(charge_match.group(2))
+                items.append(current_item)
+                continue
 
-                items.append(item)
+            # Indented detail line under the current item header.
+            # Newer remastered dumps put condition/charge on their own lines:
+            #   "       Condition: 323 / 340 (95%)"
+            #   "       Enchantment: Charge: 14 / 110"
+            if current_item is not None and line.startswith("   "):
+                cond_m = re.match(
+                    r'\s*Condition:\s*([\d.]+)\s*/\s*([\d.]+)', stripped,
+                )
+                if cond_m:
+                    current_item.condition_current = float(cond_m.group(1))
+                    current_item.condition_max = float(cond_m.group(2))
+                    continue
+                ench_m = re.search(
+                    r'Charge:\s*([\d.]+)\s*/\s*([\d.]+)', stripped,
+                )
+                if ench_m:
+                    current_item.enchant_current = float(ench_m.group(1))
+                    current_item.enchant_max = float(ench_m.group(2))
+                    continue
+                # Classic dumps sometimes show "Charge: 260" with no /max
+                ench_single = re.match(r'\s*Charge:\s*([\d.]+)\s*$', stripped)
+                if ench_single:
+                    current_item.enchant_current = float(ench_single.group(1))
+                    continue
 
         return items
 
@@ -1008,14 +1151,25 @@ class SaveDumpParser:
             if not line or line.startswith("Total active"):
                 continue
 
-            # Effect line: "[0] STMA  Mag=1.0  Dur=0.0  State=Removed"
-            m = re.match(r'\[\d+\]\s+(\w+)\s+Mag=([\d.\-]+)\s+Dur=([\d.\-]+)\s+State=(\w+)', line)
+            # Effect line — two known shapes:
+            #   "[0] STMA  Mag=1.0  Dur=0.0  State=Removed"           (compact)
+            #   "[0] Weakness to Magic (LOC_FN_WKMA) [WKMA]  Mag=-100.0  Dur=0.0  State=Removed"
+            m = re.match(
+                r'\[\d+\]\s+.*?\[(\w+)\]\s+Mag=([\d.\-]+)\s+Dur=([\d.\-]+)\s+State=(\w+)',
+                line,
+            )
+            if not m:
+                # Fallback to the compact form (effect code as first token)
+                m = re.match(
+                    r'\[\d+\]\s+(\w+)\s+Mag=([\d.\-]+)\s+Dur=([\d.\-]+)\s+State=(\w+)',
+                    line,
+                )
             if m:
                 current_effect = ActiveMagicEffect(
                     effect_code=m.group(1),
                     magnitude=float(m.group(2)),
                     duration=float(m.group(3)),
-                    state=m.group(4)
+                    state=m.group(4),
                 )
                 effects.append(current_effect)
                 continue
